@@ -1,88 +1,292 @@
-// CONTRACT / INVARIANTS
-// - Bridges OpenAI tool_call dispatch to MCP tool execution.
-// - Switch/case MVP: routes by tool name to the correct MCP tool method.
-// - Accepts (toolName, argumentsJson) and returns the tool's result string.
-// - Parses OpenAI-format JSON arguments and maps to method parameters.
-// - Returns JSON error object on failure (never throws to caller).
-// - Thread-safe: no mutable state; tool class dependencies are singletons.
-// - When new MCP tools are added, extend the switch/case and add to this file.
-
+using System.Globalization;
 using System.Text.Json;
 
 namespace LifeTrader_AI.Infrastructure.Mcp
 {
     /// <summary>
-    /// Routes OpenAI tool calls to MCP tool methods.
-    /// Singleton — dependencies (McpMarketTools) are effectively stateless/singleton.
+    /// Single execution gateway for all MCP-backed AI tool calls.
     /// </summary>
     public sealed class McpToolInvoker
     {
-        private readonly McpMarketTools _marketTools;
-        private readonly ILogger<McpToolInvoker> _logger;
+        private sealed record ToolRoute(
+            bool IsStateChanging,
+            Func<JsonElement, CancellationToken, Task<McpToolResult>> Handler);
 
-        public McpToolInvoker(McpMarketTools marketTools, ILogger<McpToolInvoker> logger)
+        private readonly McpMarketTools _marketTools;
+        private readonly McpExecutionTools _executionTools;
+        private readonly ILogger<McpToolInvoker> _logger;
+        private readonly IReadOnlyDictionary<string, ToolRoute> _routes;
+        private readonly IReadOnlySet<string> _stateChangingTools;
+
+        public McpToolInvoker(
+            McpMarketTools marketTools,
+            McpExecutionTools executionTools,
+            ILogger<McpToolInvoker> logger)
         {
             _marketTools = marketTools;
+            _executionTools = executionTools;
             _logger = logger;
+
+            var routes = new Dictionary<string, ToolRoute>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["query_local_market_data"] = new(
+                    IsStateChanging: false,
+                    Handler: InvokeQueryLocalMarketDataAsync),
+                ["execute_trade"] = new(
+                    IsStateChanging: true,
+                    Handler: InvokeExecuteTradeAsync),
+                ["open_chart"] = new(
+                    IsStateChanging: false,
+                    Handler: InvokeOpenChartAsync)
+            };
+
+            _routes = routes;
+            _stateChangingTools = routes
+                .Where(kv => kv.Value.IsStateChanging)
+                .Select(kv => kv.Key)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
         }
 
-        /// <summary>
-        /// Invoke an MCP tool by name with JSON arguments from OpenAI.
-        /// Returns the tool result string (JSON on success, JSON error on failure).
-        /// </summary>
-        public async Task<string> InvokeAsync(string toolName, string argumentsJson, CancellationToken ct = default)
+        public bool IsStateChangingTool(string toolName) => _stateChangingTools.Contains(toolName);
+
+        public async Task<McpToolResult> InvokeAsync(
+            string toolName,
+            string argumentsJson,
+            CancellationToken ct = default)
         {
-            _logger.LogDebug("[McpInvoker] Invoking MCP tool: {ToolName}", toolName);
+            _logger.LogDebug("[McpInvoker] Invoking tool: {ToolName}", toolName);
+
+            if (!_routes.TryGetValue(toolName, out var route))
+            {
+                string msg = $"Unknown MCP tool: '{toolName}'.";
+                _logger.LogWarning("[McpInvoker] {Message}", msg);
+                return BuildInvokerFailure(msg);
+            }
 
             try
             {
-                switch (toolName)
-                {
-                    case "query_local_market_data":
-                        return await InvokeQueryLocalMarketData(argumentsJson);
-
-                    default:
-                        _logger.LogWarning("[McpInvoker] Unknown MCP tool: {ToolName}", toolName);
-                        return BuildErrorJson($"Unknown MCP tool: '{toolName}'");
-                }
+                string normalizedJson = string.IsNullOrWhiteSpace(argumentsJson) ? "{}" : argumentsJson;
+                using var doc = JsonDocument.Parse(normalizedJson);
+                return await route.Handler(doc.RootElement, ct);
             }
             catch (JsonException ex)
             {
-                _logger.LogWarning(ex, "[McpInvoker] Failed to parse arguments for tool '{ToolName}'", toolName);
-                return BuildErrorJson($"Invalid arguments JSON for tool '{toolName}'.");
+                _logger.LogWarning(ex, "[McpInvoker] Invalid args JSON for tool '{ToolName}'", toolName);
+                return BuildInvokerFailure($"Invalid arguments JSON for tool '{toolName}'.");
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[McpInvoker] Unhandled exception invoking tool '{ToolName}'", toolName);
-                return BuildErrorJson($"Internal error invoking tool '{toolName}'.");
+                return BuildInvokerFailure($"Internal error invoking tool '{toolName}'.");
             }
         }
 
-        // ================================================================
-        // Tool dispatch methods — one per MCP tool
-        // ================================================================
-
-        private async Task<string> InvokeQueryLocalMarketData(string argumentsJson)
+        private async Task<McpToolResult> InvokeQueryLocalMarketDataAsync(
+            JsonElement root,
+            CancellationToken ct)
         {
-            using var doc = JsonDocument.Parse(argumentsJson);
-            var root = doc.RootElement;
+            if (!TryGetRequiredString(root, "symbol", out string symbol, out string err))
+                return BuildInvokerFailure(err);
 
-            string symbol = root.GetProperty("symbol").GetString() ?? "";
-
-            int days = 7; // default
-            if (root.TryGetProperty("days", out var daysProp) && daysProp.ValueKind == JsonValueKind.Number)
+            int days = 7;
+            if (root.TryGetProperty("days", out var daysProp))
             {
-                days = daysProp.GetInt32();
+                if (!TryReadInt(daysProp, out days))
+                    return BuildInvokerFailure("Argument 'days' must be an integer.");
             }
 
-            return await _marketTools.QueryLocalMarketData(symbol, days);
+            string content = await _marketTools.QueryLocalMarketData(symbol, days);
+            return InferSuccess(content)
+                ? McpToolResult.Success(content)
+                : McpToolResult.Failure(content);
         }
 
-        // ================================================================
+        private Task<McpToolResult> InvokeExecuteTradeAsync(JsonElement root, CancellationToken ct)
+        {
+            if (!TryGetRequiredString(root, "action", out string action, out string actionErr))
+                return Task.FromResult(BuildInvokerFailure(actionErr));
+
+            if (!TryGetRequiredString(root, "symbol", out string symbol, out string symbolErr))
+                return Task.FromResult(BuildInvokerFailure(symbolErr));
+
+            if (!TryGetRequiredInt(root, "shares", out int shares, out string sharesErr))
+                return Task.FromResult(BuildInvokerFailure(sharesErr));
+
+            if (!TryGetRequiredDecimal(root, "price", out decimal price, out string priceErr))
+                return Task.FromResult(BuildInvokerFailure(priceErr));
+
+            return _executionTools.ExecuteTradeInternalAsync(action, symbol, shares, price, ct);
+        }
+
+        private Task<McpToolResult> InvokeOpenChartAsync(JsonElement root, CancellationToken ct)
+        {
+            if (!TryGetRequiredString(root, "symbol", out string symbol, out string symbolErr))
+                return Task.FromResult(BuildInvokerFailure(symbolErr));
+
+            string? tf = TryGetOptionalString(root, "tf");
+            string? range = TryGetOptionalString(root, "range");
+            return Task.FromResult(_executionTools.OpenChartInternal(symbol, tf, range));
+        }
+
+        private static bool TryGetRequiredInt(
+            JsonElement root,
+            string property,
+            out int value,
+            out string error)
+        {
+            value = default;
+            error = "";
+
+            if (!root.TryGetProperty(property, out var prop))
+            {
+                error = $"Missing required argument '{property}'.";
+                return false;
+            }
+
+            if (!TryReadInt(prop, out value))
+            {
+                error = $"Argument '{property}' must be an integer.";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool TryGetRequiredDecimal(
+            JsonElement root,
+            string property,
+            out decimal value,
+            out string error)
+        {
+            value = default;
+            error = "";
+
+            if (!root.TryGetProperty(property, out var prop))
+            {
+                error = $"Missing required argument '{property}'.";
+                return false;
+            }
+
+            if (!TryReadDecimal(prop, out value))
+            {
+                error = $"Argument '{property}' must be a number.";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool TryGetRequiredString(
+            JsonElement root,
+            string property,
+            out string value,
+            out string error)
+        {
+            value = "";
+            error = "";
+
+            if (!root.TryGetProperty(property, out var prop))
+            {
+                error = $"Missing required argument '{property}'.";
+                return false;
+            }
+
+            if (prop.ValueKind != JsonValueKind.String)
+            {
+                error = $"Argument '{property}' must be a string.";
+                return false;
+            }
+
+            value = prop.GetString()?.Trim() ?? "";
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                error = $"Argument '{property}' cannot be empty.";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static string? TryGetOptionalString(JsonElement root, string property)
+        {
+            if (!root.TryGetProperty(property, out var prop))
+                return null;
+
+            if (prop.ValueKind == JsonValueKind.Null || prop.ValueKind == JsonValueKind.Undefined)
+                return null;
+
+            return prop.ValueKind == JsonValueKind.String ? prop.GetString() : null;
+        }
+
+        private static bool TryReadInt(JsonElement el, out int value)
+        {
+            value = default;
+
+            return el.ValueKind switch
+            {
+                JsonValueKind.Number => el.TryGetInt32(out value),
+                JsonValueKind.String => int.TryParse(
+                    el.GetString(),
+                    NumberStyles.Integer,
+                    CultureInfo.InvariantCulture,
+                    out value),
+                _ => false
+            };
+        }
+
+        private static bool TryReadDecimal(JsonElement el, out decimal value)
+        {
+            value = default;
+
+            return el.ValueKind switch
+            {
+                JsonValueKind.Number => el.TryGetDecimal(out value),
+                JsonValueKind.String => decimal.TryParse(
+                    el.GetString(),
+                    NumberStyles.Number,
+                    CultureInfo.InvariantCulture,
+                    out value),
+                _ => false
+            };
+        }
+
+        private static bool InferSuccess(string content)
+        {
+            if (string.IsNullOrWhiteSpace(content))
+                return false;
+
+            if (content.StartsWith("ERROR", StringComparison.OrdinalIgnoreCase) ||
+                content.StartsWith("SYSTEM ERROR", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            try
+            {
+                using var doc = JsonDocument.Parse(content);
+                if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                    doc.RootElement.TryGetProperty("ok", out var okProp) &&
+                    okProp.ValueKind == JsonValueKind.False)
+                {
+                    return false;
+                }
+            }
+            catch
+            {
+                // Non-JSON output is valid for execute_trade/open_chart.
+            }
+
+            return true;
+        }
+
+        private static McpToolResult BuildInvokerFailure(string message)
+        {
+            return McpToolResult.Failure(BuildErrorJson(message), message);
+        }
 
         private static string BuildErrorJson(string message)
         {
-            var escaped = message.Replace("\\", "\\\\").Replace("\"", "\\\"");
+            string escaped = message.Replace("\\", "\\\\").Replace("\"", "\\\"");
             return $"{{\"ok\":false,\"error\":\"{escaped}\"}}";
         }
     }

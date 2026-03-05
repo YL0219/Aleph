@@ -49,6 +49,7 @@ builder.Services.AddSingleton<PythonDispatcherService>();
 // 1.10 MARKET DATA INGESTION (background 5-min OHLCV cycle)
 builder.Services.AddHostedService<MarketIngestionOrchestrator>();
 
+
 // 1.11 MCP SERVER (Model Context Protocol — HTTP/SSE transport)
 // Exposes market tools via MCP. Tools discovered from [McpServerToolType] classes in this assembly.
 // Endpoint: /mcp (mapped below via app.MapMcp())
@@ -69,6 +70,7 @@ builder.Services
 // McpToolSchemaAdapter: reflects on assembly to build OpenAI function schemas, caches result.
 // McpToolInvoker: routes OpenAI tool_call dispatch to MCP tool methods.
 builder.Services.AddSingleton<McpMarketTools>();
+builder.Services.AddSingleton<McpExecutionTools>();
 builder.Services.AddSingleton<McpToolSchemaAdapter>();
 builder.Services.AddSingleton<McpToolInvoker>();
 
