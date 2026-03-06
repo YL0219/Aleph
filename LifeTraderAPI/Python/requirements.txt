@@ -8,3 +8,8 @@ yfinance>=0.2.30       # Fallback provider — direct Yahoo Finance
 # Data processing & storage
 pandas>=2.0.0          # DataFrame manipulation
 pyarrow>=14.0.0        # Parquet read/write engine
+
+# News and web extraction
+feedparser>=6.0.10
+trafilatura>=1.8.0
+pydantic>=2.6.0

@@ -17,6 +17,10 @@ Market domain actions:
     fetch-candles   OHLCV candle data for a single symbol
     parquet-read    Read local Parquet data lake
 
+News domain actions:
+    headlines       Fetch recent headlines (OpenBB -> yfinance -> RSS fallback)
+    scrape          Scrape website text with SSRF protections
+
 Legacy domain actions:
     fetch-news      RSI + news sentiment report (stdout is human-readable text, NOT JSON)
 
@@ -25,6 +29,8 @@ Examples:
     python python_router.py market fetch-quote --symbol AMD
     python python_router.py market fetch-candles --symbol AMD --tf 1d --range 180d --limit 500
     python python_router.py market parquet-read --symbol AMD --days 7
+    python python_router.py news headlines --symbol AMD --limit 5
+    python python_router.py news scrape --url https://example.com --timeoutSec 12
     python python_router.py legacy fetch-news AMD
 """
 
@@ -72,6 +78,18 @@ def _route_legacy(action, remaining):
         _error_exit(f"Unknown legacy action: '{action}'. Valid: fetch-news")
 
 
+def _route_news(action, remaining):
+    """Dispatch news domain actions to worker modules."""
+    if action == "headlines":
+        from Workers.news_headlines import main as worker_main
+        worker_main(remaining)
+    elif action == "scrape":
+        from Workers.scrape_text import main as worker_main
+        worker_main(remaining)
+    else:
+        _error_exit(f"Unknown news action: '{action}'. Valid: headlines, scrape")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Deep Blue Python Router — thin dispatcher to worker modules")
@@ -88,10 +106,12 @@ def main():
 
     if args.domain == "market":
         _route_market(args.action, remaining)
+    elif args.domain == "news":
+        _route_news(args.action, remaining)
     elif args.domain == "legacy":
         _route_legacy(args.action, remaining)
     else:
-        _error_exit(f"Unknown domain: '{args.domain}'. Valid: market, legacy")
+        _error_exit(f"Unknown domain: '{args.domain}'. Valid: market, news, legacy")
 
 
 if __name__ == "__main__":

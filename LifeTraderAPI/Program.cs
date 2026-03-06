@@ -71,6 +71,7 @@ builder.Services
 // McpToolInvoker: routes OpenAI tool_call dispatch to MCP tool methods.
 builder.Services.AddSingleton<McpMarketTools>();
 builder.Services.AddSingleton<McpExecutionTools>();
+builder.Services.AddSingleton<McpNewsTools>();
 builder.Services.AddSingleton<McpToolSchemaAdapter>();
 builder.Services.AddSingleton<McpToolInvoker>();
 

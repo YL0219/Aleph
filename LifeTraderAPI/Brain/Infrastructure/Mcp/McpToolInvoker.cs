@@ -14,6 +14,7 @@ namespace LifeTrader_AI.Infrastructure.Mcp
 
         private readonly McpMarketTools _marketTools;
         private readonly McpExecutionTools _executionTools;
+        private readonly McpNewsTools _newsTools;
         private readonly ILogger<McpToolInvoker> _logger;
         private readonly IReadOnlyDictionary<string, ToolRoute> _routes;
         private readonly IReadOnlySet<string> _stateChangingTools;
@@ -21,10 +22,12 @@ namespace LifeTrader_AI.Infrastructure.Mcp
         public McpToolInvoker(
             McpMarketTools marketTools,
             McpExecutionTools executionTools,
+            McpNewsTools newsTools,
             ILogger<McpToolInvoker> logger)
         {
             _marketTools = marketTools;
             _executionTools = executionTools;
+            _newsTools = newsTools;
             _logger = logger;
 
             var routes = new Dictionary<string, ToolRoute>(StringComparer.OrdinalIgnoreCase)
@@ -37,7 +40,13 @@ namespace LifeTrader_AI.Infrastructure.Mcp
                     Handler: InvokeExecuteTradeAsync),
                 ["open_chart"] = new(
                     IsStateChanging: false,
-                    Handler: InvokeOpenChartAsync)
+                    Handler: InvokeOpenChartAsync),
+                ["get_news_headlines"] = new(
+                    IsStateChanging: false,
+                    Handler: InvokeGetNewsHeadlinesAsync),
+                ["scrape_website_text"] = new(
+                    IsStateChanging: false,
+                    Handler: InvokeScrapeWebsiteTextAsync)
             };
 
             _routes = routes;
@@ -126,6 +135,45 @@ namespace LifeTrader_AI.Infrastructure.Mcp
             string? tf = TryGetOptionalString(root, "tf");
             string? range = TryGetOptionalString(root, "range");
             return Task.FromResult(_executionTools.OpenChartInternal(symbol, tf, range));
+        }
+
+        private async Task<McpToolResult> InvokeGetNewsHeadlinesAsync(
+            JsonElement root,
+            CancellationToken ct)
+        {
+            string symbol = TryGetOptionalString(root, "symbol") ?? "";
+
+            int limit = 10;
+            if (root.TryGetProperty("limit", out var limitProp))
+            {
+                if (!TryReadInt(limitProp, out limit))
+                    return BuildInvokerFailure("Argument 'limit' must be an integer.");
+            }
+
+            string content = await _newsTools.GetNewsHeadlines(symbol, limit, ct);
+            return InferSuccess(content)
+                ? McpToolResult.Success(content)
+                : McpToolResult.Failure(content);
+        }
+
+        private async Task<McpToolResult> InvokeScrapeWebsiteTextAsync(
+            JsonElement root,
+            CancellationToken ct)
+        {
+            if (!TryGetRequiredString(root, "url", out string url, out string urlErr))
+                return BuildInvokerFailure(urlErr);
+
+            int timeoutSec = 12;
+            if (root.TryGetProperty("timeoutSec", out var timeoutProp))
+            {
+                if (!TryReadInt(timeoutProp, out timeoutSec))
+                    return BuildInvokerFailure("Argument 'timeoutSec' must be an integer.");
+            }
+
+            string content = await _newsTools.ScrapeWebsiteText(url, timeoutSec, ct);
+            return InferSuccess(content)
+                ? McpToolResult.Success(content)
+                : McpToolResult.Failure(content);
         }
 
         private static bool TryGetRequiredInt(
