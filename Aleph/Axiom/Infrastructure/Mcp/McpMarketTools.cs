@@ -1,51 +1,31 @@
-// CONTRACT / INVARIANTS
-// - Exposes market data tools via Model Context Protocol (MCP).
-// - Decorated with [McpServerToolType] for assembly-level discovery.
-// - Each tool method decorated with [McpServerTool] + [Description].
-// - Validates all symbol inputs via SymbolValidator — rejects invalid symbols.
-// - Clamps "days" to [1..365] to prevent unbounded data reads.
-// - Calls PythonDispatcherService.RunParquetReadAsync (never spawns Python directly).
-// - Returns JSON string: success passthrough from Python stdout, or error JSON object.
-// - Thread-safe: no mutable state; dispatcher handles concurrency gating.
-
 using System.ComponentModel;
+using Microsoft.Extensions.Hosting;
 using ModelContextProtocol.Server;
-
+using Microsoft.Extensions.Logging;
 
 namespace Aleph
 {
-    /// <summary>
-    /// MCP tool class for market data queries.
-    /// Discovered by WithToolsFromAssembly() via [McpServerToolType].
-    /// Instance methods — framework constructs a new instance per invocation,
-    /// injecting registered services via constructor.
-    /// </summary>
     [McpServerToolType]
     public class McpMarketTools
     {
-        private const int MinDays = 1;
+        private const int MinDays = 5;
         private const int MaxDays = 365;
         private const int ParquetReadTimeoutMs = 30_000;
 
-        // Parquet data lake root — matches MarketIngestionOrchestrator.OutRoot
-        private const string DataRoot = "data_lake/market/ohlcv";
-
         private readonly PythonDispatcherService _dispatcher;
         private readonly ILogger<McpMarketTools> _logger;
+        private readonly IHostEnvironment _env;
 
         public McpMarketTools(
             PythonDispatcherService dispatcher,
-            ILogger<McpMarketTools> logger)
+            ILogger<McpMarketTools> logger,
+            IHostEnvironment env)
         {
             _dispatcher = dispatcher;
             _logger = logger;
+            _env = env;
         }
 
-        /// <summary>
-        /// Reads local OHLCV market data from the Parquet data lake for a given symbol.
-        /// Returns a JSON object with candle data, summary statistics, and metadata.
-        /// Data must have been previously ingested by the market ingestion pipeline.
-        /// </summary>
         [McpServerTool(Name = "query_local_market_data", ReadOnly = true)]
         [Description(
             "Query locally-stored OHLCV market data for a stock symbol. " +
@@ -53,63 +33,67 @@ namespace Aleph
             "Data is sourced from prior ingestion cycles — not a live API call. " +
             "Use this for historical analysis, trend review, and portfolio monitoring.")]
         public async Task<string> QueryLocalMarketData(
-            [Description("Stock ticker symbol (e.g. AAPL, MSFT, BRK.B). 1-15 uppercase alphanumeric characters, dots, or hyphens.")]
+            [Description("Stock ticker symbol (e.g. AAPL, MSFT, BRK.B). 1-15 uppercase alphanumeric characters.")]
             string symbol,
-            [Description("Number of days of historical data to retrieve (1-365). Defaults to 7.")]
+            [Description("Number of days of historical data to retrieve. MINIMUM IS 5 (to account for weekends). Defaults to 7.")]
             int days = 7)
         {
-            // --- Validate symbol ---
             if (!SymbolValidator.TryNormalize(symbol, out var normalizedSymbol))
             {
-                _logger.LogWarning("[MCP] Invalid symbol rejected: '{Symbol}'", symbol);
-                return BuildErrorJson($"Invalid symbol: '{symbol}'. Must be 1-15 characters, uppercase letters, digits, dots, or hyphens.");
+                return BuildErrorJson($"Invalid symbol: '{symbol}'.");
             }
 
-            // --- Clamp days ---
             var clampedDays = Math.Clamp(days, MinDays, MaxDays);
-            if (clampedDays != days)
-            {
-                _logger.LogDebug("[MCP] Days clamped from {Requested} to {Clamped}", days, clampedDays);
-            }
 
-            // --- Check dispatcher availability ---
             if (!_dispatcher.IsAvailable)
             {
-                _logger.LogWarning("[MCP] Python dispatcher not available for parquet read.");
-                return BuildErrorJson("Python environment not available. Run setup_venv.ps1 to create the venv.");
+                return BuildErrorJson("Python environment not available.");
             }
 
-            // --- Execute Parquet read via dispatcher ---
-            _logger.LogDebug("[MCP] QueryLocalMarketData: symbol={Symbol}, days={Days}", normalizedSymbol, clampedDays);
+            // FIX 1: Force forward slashes so Python doesn't break on Windows paths
+            var absoluteDataRoot = Path.GetFullPath(Path.Combine(_env.ContentRootPath, "data_lake", "market", "ohlcv")).Replace("\\", "/");
+
+            _logger.LogInformation("[MCP] Executing Parquet Read. Symbol={Symbol}, Root={Root}", normalizedSymbol, absoluteDataRoot);
 
             var result = await _dispatcher.RunParquetReadAsync(
                 normalizedSymbol,
                 clampedDays,
-                DataRoot,
+                absoluteDataRoot,
                 ParquetReadTimeoutMs);
+
+            // --- THE X-RAY LOGS ---
+            _logger.LogInformation("[MCP] Python ExitCode: {Code}", result.ExitCode);
+            _logger.LogInformation("[MCP] Python Stdout: {Stdout}", result.Stdout);
+            
+            if (!string.IsNullOrWhiteSpace(result.Stderr)) 
+            {
+                _logger.LogWarning("[MCP] Python Stderr: {Stderr}", result.Stderr);
+            }
+
+            // FIX 2: Safely extract JSON even if Python printed weird warnings before it
+            var jsonPayload = result.Stdout ?? string.Empty;
+            var jsonStartIndex = jsonPayload.IndexOf('{');
+            if (jsonStartIndex >= 0)
+            {
+                // Cut out any warnings that appeared before the JSON
+                jsonPayload = jsonPayload.Substring(jsonStartIndex);
+                return jsonPayload;
+            }
 
             if (!result.Success)
             {
-                _logger.LogWarning("[MCP] Parquet read failed for {Symbol}: exit={ExitCode}, stderr={Stderr}",
-                    normalizedSymbol, result.ExitCode, result.Stderr);
-
                 var reason = result.TimedOut
                     ? "Parquet read timed out."
-                    : $"Parquet read failed (exit code {result.ExitCode}).";
+                    : $"Parquet read failed (exit code {result.ExitCode}). {result.Stderr}";
 
                 return BuildErrorJson(reason);
             }
 
-            // Success — return raw JSON from Python stdout
-            return result.Stdout;
+            return result.Stdout ?? BuildErrorJson("Empty output from Python.");
         }
 
-        /// <summary>
-        /// Builds a simple JSON error object string.
-        /// </summary>
         private static string BuildErrorJson(string message)
         {
-            // Manual construction avoids System.Text.Json allocation for trivial shape
             var escaped = message.Replace("\\", "\\\\").Replace("\"", "\\\"");
             return $"{{\"ok\":false,\"error\":\"{escaped}\"}}";
         }

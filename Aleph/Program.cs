@@ -2,14 +2,14 @@ using Aleph;
 using Microsoft.EntityFrameworkCore;
 using Serilog;
 
-// --- 0. ENTERPRISE LOGGER (Serilog) ---
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Debug()
     .MinimumLevel.Override("Microsoft", Serilog.Events.LogEventLevel.Warning)
     .MinimumLevel.Override("Microsoft.EntityFrameworkCore.Database.Command", Serilog.Events.LogEventLevel.Warning)
     .MinimumLevel.Override("System", Serilog.Events.LogEventLevel.Warning)
     .WriteTo.Console(restrictedToMinimumLevel: Serilog.Events.LogEventLevel.Information)
-    .WriteTo.File("logs/deepblue_log_.txt",
+    .WriteTo.File(
+        "logs/deepblue_log_.txt",
         rollingInterval: RollingInterval.Day,
         retainedFileCountLimit: 7,
         restrictedToMinimumLevel: Serilog.Events.LogEventLevel.Debug)
@@ -20,34 +20,27 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Logging.ClearProviders();
 builder.Host.UseSerilog();
 
-// 1. CONTROLLERS
 builder.Services.AddControllers();
 
-// 1.5 DATABASE (EF Core + SQLite, Scoped per-request)
-builder.Services.AddDbContext<AppDbContext>(options =>
-    options.UseSqlite("Data Source=deepblue.db"));
+var sqliteConnectionString =
+    builder.Configuration.GetConnectionString("Aleph")
+    ?? builder.Configuration.GetConnectionString("DefaultConnection")
+    ?? "Data Source=deepblue.db";
 
-// 1.6 SERVICE LAYER (Scoped — shares DbContext lifetime)
+// AddDbContextFactory automatically registers both the Singleton Factory 
+// AND the Scoped DbContext for your legacy controllers.
+builder.Services.AddDbContextFactory<AppDbContext>(options =>
+    options.UseSqlite(sqliteConnectionString));
+
 builder.Services.AddScoped<TradingService>();
 
-// 1.7 MEMORY CACHE (10s TTL, reduces redundant API calls)
 builder.Services.AddMemoryCache();
 
-// 1.8 PYTHON PATH RESOLVER (Singleton — resolves Python:ExePath once at startup)
-// If the venv is missing, PythonPathResolver logs a warning but does NOT crash.
 builder.Services.AddSingleton<PythonPathResolver>();
-
-// 1.9 PYTHON DISPATCHER (Single gateway — the ONLY class that spawns Python processes)
-// Encapsulates SemaphoreSlim(3) gating internally. Routes all calls through python_router.py.
 builder.Services.AddSingleton<PythonDispatcherService>();
 
-// 1.10 MARKET DATA INGESTION (background 5-min OHLCV cycle)
 builder.Services.AddHostedService<MarketIngestionOrchestrator>();
 
-
-// 1.11 MCP SERVER (Model Context Protocol — HTTP/SSE transport)
-// Exposes market tools via MCP. Tools discovered from [McpServerToolType] classes in this assembly.
-// Endpoint: /mcp (mapped below via app.MapMcp())
 builder.Services
     .AddMcpServer(options =>
     {
@@ -60,13 +53,8 @@ builder.Services
     .WithHttpTransport()
     .WithToolsFromAssembly();
 
-// 1.12 SKILL REGISTRY (Plan Engine — loads .md playbooks from Brain/Skills on startup)
 builder.Services.AddSingleton<ISkillRegistry, FileSkillRegistry>();
 
-// 1.13 MCP ↔ OPENAI BRIDGE (translates MCP tool schemas for the OpenAI agent loop)
-// McpMarketTools: singleton — deps are all singletons, no mutable state.
-// McpToolSchemaAdapter: reflects on assembly to build OpenAI function schemas, caches result.
-// McpToolInvoker: routes OpenAI tool_call dispatch to MCP tool methods.
 builder.Services.AddSingleton<McpMarketTools>();
 builder.Services.AddSingleton<McpExecutionTools>();
 builder.Services.AddSingleton<McpNewsTools>();
@@ -74,28 +62,29 @@ builder.Services.AddSingleton<McpSkillTools>();
 builder.Services.AddSingleton<McpToolSchemaAdapter>();
 builder.Services.AddSingleton<McpToolInvoker>();
 
-// 2. CORS (Unity frontend)
+builder.Services.AddSingleton<IAxiom, Axiom>();
+builder.Services.AddSingleton<IArbiter, Arbiter>();
+builder.Services.AddSingleton<IAether, Aether>();
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowUnity", policy =>
     {
         policy.AllowAnyOrigin()
-              .AllowAnyMethod()
-              .AllowAnyHeader();
+            .AllowAnyMethod()
+            .AllowAnyHeader();
     });
 });
 
 var app = builder.Build();
 
-// 3. MIDDLEWARE PIPELINE
 app.UseStaticFiles();
 app.UseCors("AllowUnity");
 app.MapControllers();
-app.MapMcp();   // MCP SSE/HTTP endpoint at /mcp
+app.MapMcp();
 
 app.Lifetime.ApplicationStopped.Register(Log.CloseAndFlush);
 
-// Load skill registry — non-fatal on failure (ingestion pipeline must not crash)
 try
 {
     var skillRegistry = app.Services.GetRequiredService<ISkillRegistry>();
@@ -103,7 +92,7 @@ try
 }
 catch (Exception ex)
 {
-    Log.Error(ex, "[Startup] Skill registry load failed — continuing with empty snapshot.");
+    Log.Error(ex, "[Startup] Skill registry load failed - continuing with empty snapshot.");
 }
 
 app.Run();

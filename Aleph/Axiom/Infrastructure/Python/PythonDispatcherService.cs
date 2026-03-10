@@ -38,7 +38,7 @@ namespace Aleph
 
             // Router lives at: <ContentRoot>/Python/python_router.py
             _routerScriptPath = Path.GetFullPath(
-                Path.Combine(env.ContentRootPath, "Python", "python_router.py"));
+                Path.Combine(env.ContentRootPath, "Axiom", "Python", "python_router.py"));
 
             if (_isAvailable && !File.Exists(_routerScriptPath))
             {

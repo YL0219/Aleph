@@ -40,7 +40,7 @@ namespace Aleph
             IWebHostEnvironment env,
             ILogger<FileSkillRegistry> logger)
         {
-            _skillsRoot = Path.GetFullPath(Path.Combine(env.ContentRootPath, "Brain", "Skills"));
+            _skillsRoot = Path.GetFullPath(Path.Combine(env.ContentRootPath, "Arbiter", "Skills"));
             _logger = logger;
             _yaml = new DeserializerBuilder().Build();
         }
