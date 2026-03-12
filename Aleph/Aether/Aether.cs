@@ -111,7 +111,7 @@ public sealed class Aether : IAether
             var args = new List<string>
             {
                 "--symbol", symbol,
-                "--days", Math.Clamp(request.Days, 1, 3650).ToString(),
+                "--days", System.Math.Clamp(request.Days, 1, 3650).ToString(),
                 "--timeframe", string.IsNullOrWhiteSpace(request.Timeframe) ? "1d" : request.Timeframe.Trim().ToLowerInvariant()
             };
 
@@ -140,7 +140,7 @@ public sealed class Aether : IAether
             var args = new List<string>
             {
                 "--symbol", symbol,
-                "--horizonDays", Math.Clamp(request.HorizonDays, 1, 365).ToString()
+                "--horizonDays", System.Math.Clamp(request.HorizonDays, 1, 365).ToString()
             };
 
             return _root.RunAsync("ml", "predict", args, DefaultTimeoutMs, ct);
@@ -158,7 +158,7 @@ public sealed class Aether : IAether
             var args = new List<string>
             {
                 "--symbol", symbol,
-                "--epochs", Math.Clamp(request.Epochs, 1, 1000).ToString()
+                "--epochs", System.Math.Clamp(request.Epochs, 1, 1000).ToString()
             };
 
             return _root.RunAsync("ml", "train", args, 120_000, ct);
@@ -205,7 +205,7 @@ public sealed class Aether : IAether
             var args = new List<string>
             {
                 "--symbol", symbol,
-                "--days", Math.Clamp(request.Days, 1, 3650).ToString(),
+                "--days", System.Math.Clamp(request.Days, 1, 3650).ToString(),
                 "--strategy", strategy
             };
 

@@ -43,18 +43,20 @@ public sealed class HeartbeatService : BackgroundService
             var nowUtc = DateTimeOffset.UtcNow;
             var mode = DetermineHeartbeatMode(nowUtc);
 
+            _logger.LogInformation("[Heartbeat] Pulse triggered. Mode: {Mode}", mode);
+
             try
             {
                 if (mode == HeartbeatMode.Fast)
                 {
                     await _aether.Ml.GetStatusAsync(new MlStatusRequest(), stoppingToken);
                     await _aether.Macro.CheckRegimeAsync(new MacroRegimeRequest(), stoppingToken);
-                    _logger.LogDebug("[Heartbeat] Fast cycle completed.");
+                    _logger.LogInformation("[Heartbeat] Fast cycle completed.");
                 }
                 else
                 {
                     await _aether.Ml.TrainAsync(new MlTrainRequest("SPY", 1), stoppingToken);
-                    _logger.LogDebug("[Heartbeat] Slow cycle completed.");
+                    _logger.LogInformation("[Heartbeat] Slow cycle completed.");
                 }
             }
             catch (OperationCanceledException)
