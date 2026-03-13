@@ -44,6 +44,11 @@ namespace Aleph
         public DbSet<MarketDataAsset> MarketDataAssets { get; set; } = null!;
 
         /// <summary>
+        /// Persisted autonomic and heartbeat events (written by the Kidneys).
+        /// </summary>
+        public DbSet<AutonomicEvent> AutonomicEvents { get; set; } = null!;
+
+        /// <summary>
         /// Auto-increments RowVersion on any modified Position entity before saving.
         /// This ensures the concurrency token is always updated, even if the service
         /// layer forgets to do it manually.
@@ -209,6 +214,21 @@ namespace Aleph
                       .HasDefaultValue(0);
 
                 entity.Property(a => a.UpdatedAtUtc)
+                      .HasDefaultValueSql("datetime('now')");
+            });
+
+            // === AutonomicEvent Configuration (Kidneys) ===
+            modelBuilder.Entity<AutonomicEvent>(entity =>
+            {
+                entity.ToTable("AutonomicEvents");
+
+                entity.HasIndex(e => e.OccurredAtUtc)
+                      .HasDatabaseName("IX_AutonomicEvents_OccurredAtUtc");
+
+                entity.HasIndex(e => e.Kind)
+                      .HasDatabaseName("IX_AutonomicEvents_Kind");
+
+                entity.Property(e => e.OccurredAtUtc)
                       .HasDefaultValueSql("datetime('now')");
             });
 

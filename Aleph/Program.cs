@@ -39,8 +39,13 @@ builder.Services.AddMemoryCache();
 builder.Services.AddSingleton<PythonPathResolver>();
 builder.Services.AddSingleton<PythonDispatcherService>();
 
+// AlephBus — singleton in-memory fan-out event bus (the Veins).
+builder.Services.AddSingleton<AlephBus>();
+builder.Services.AddSingleton<IAlephBus>(sp => sp.GetRequiredService<AlephBus>());
+
 // Homeostasis singleton — serves both IHomeostasis (full read/write for Heartbeat)
 // and IStressInjector (narrow write-only for external domains).
+// Now receives IAlephBus to publish circulatory events.
 builder.Services.AddSingleton<Homeostasis>();
 builder.Services.AddSingleton<IHomeostasis>(sp => sp.GetRequiredService<Homeostasis>());
 builder.Services.AddSingleton<IStressInjector>(sp => sp.GetRequiredService<Homeostasis>());
@@ -48,6 +53,9 @@ builder.Services.AddSingleton<IStressInjector>(sp => sp.GetRequiredService<Homeo
 builder.Services.AddScoped<IMarketStressDetector, MarketStressDetector>();
 builder.Services.AddScoped<IMarketIngestionCycle, MarketIngestionOrchestrator>();
 builder.Services.AddHostedService<HeartbeatService>();
+
+// Kidneys — background persistence consumer for autonomic/heartbeat events.
+builder.Services.AddHostedService<AutonomicPersistenceService>();
 
 builder.Services
     .AddMcpServer(options =>

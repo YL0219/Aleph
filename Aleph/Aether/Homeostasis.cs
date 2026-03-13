@@ -10,6 +10,7 @@ public sealed class Homeostasis : IHomeostasis, IStressInjector
 {
     private readonly object _lock = new();
     private readonly ILogger<Homeostasis> _logger;
+    private readonly IAlephBus _bus;
 
     // ── Mutable internal state — only touched under _lock ──
     private double _stressLevel;
@@ -24,10 +25,9 @@ public sealed class Homeostasis : IHomeostasis, IStressInjector
     private readonly LinkedList<StressSourceEntry> _recentStressSources = new();
     private const int MaxRecentStressSources = 50;
 
-    // ── Autonomic event log (bounded in-memory ring, under _lock) ──
-    private readonly LinkedList<AutonomicEvent> _eventLog = new();
-    private const int MaxEventLogCount = 2000;
-    private static readonly TimeSpan MaxEventAge = TimeSpan.FromDays(14);
+    // ── Small recent event cache for observability (replaces former primary event log) ──
+    private readonly LinkedList<AutonomicEventRecord> _recentEventCache = new();
+    private const int MaxRecentEventCacheCount = 200;
 
     // ── Tuning constants ──
     private const double StressDecayRate = 0.85;
@@ -40,8 +40,9 @@ public sealed class Homeostasis : IHomeostasis, IStressInjector
     private const int BreathlessFailureStreak = 3;
     private const long SlowPulseThresholdMs = 15_000;
 
-    public Homeostasis(ILogger<Homeostasis> logger)
+    public Homeostasis(IAlephBus bus, ILogger<Homeostasis> logger)
     {
+        _bus = bus;
         _logger = logger;
     }
 
@@ -69,12 +70,29 @@ public sealed class Homeostasis : IHomeostasis, IStressInjector
     {
         if (envelope is null) return;
 
+        AutonomicStressEvent? busEvent = null;
+
         lock (_lock)
         {
             switch (envelope.Kind)
             {
                 case PulseKind.ExternalStress:
                     ApplyExternalStressUnsafe(envelope);
+                    // Build bus event inside lock so we capture current state
+                    busEvent = new AutonomicStressEvent
+                    {
+                        OccurredAtUtc = DateTimeOffset.UtcNow,
+                        Source = envelope.Source,
+                        Kind = "external_stress",
+                        Severity = envelope.Severity,
+                        Tags = envelope.Tags,
+                        Message = envelope.Message,
+                        Metrics = envelope.Metrics,
+                        StressLevel = _stressLevel,
+                        FatigueLevel = _fatigueLevel,
+                        OverloadLevel = _overloadLevel,
+                        FailureStreak = _failureStreak
+                    };
                     break;
 
                 case PulseKind.SystemEvent:
@@ -91,11 +109,17 @@ public sealed class Homeostasis : IHomeostasis, IStressInjector
 
             _lastUpdatedUtc = DateTimeOffset.UtcNow;
         }
+
+        // Publish outside lock — non-blocking fire-and-forget
+        if (busEvent is not null)
+            _ = _bus.PublishAsync(busEvent);
     }
 
     public void RecordPulse(PulseEnvelope report)
     {
         if (report is null) return;
+
+        HeartbeatPulseEvent? busEvent = null;
 
         lock (_lock)
         {
@@ -136,8 +160,8 @@ public sealed class Homeostasis : IHomeostasis, IStressInjector
             if (IsOverloadedUnsafe) _activeFlags.Add("overloaded");
             if (IsBreathlessUnsafe) _activeFlags.Add("breathless");
 
-            // Record pulse as autonomic event
-            RecordEventUnsafe(new AutonomicEvent
+            // Record pulse in recent cache for observability
+            CacheEventUnsafe(new AutonomicEventRecord
             {
                 TimestampUtc = DateTimeOffset.UtcNow,
                 Source = report.Source,
@@ -148,11 +172,32 @@ public sealed class Homeostasis : IHomeostasis, IStressInjector
                 Tags = report.Tags
             });
 
+            // Build bus event inside lock to capture current state
+            busEvent = new HeartbeatPulseEvent
+            {
+                OccurredAtUtc = DateTimeOffset.UtcNow,
+                Source = report.Source,
+                Kind = "heartbeat_pulse",
+                Severity = report.Severity,
+                Tags = report.Tags,
+                DurationMs = (long)durationMs,
+                Success = success,
+                Message = success ? "Pulse succeeded" : $"Pulse failed: {report.Message}",
+                Metrics = report.Metrics,
+                StressLevel = _stressLevel,
+                FatigueLevel = _fatigueLevel,
+                OverloadLevel = _overloadLevel,
+                FailureStreak = _failureStreak
+            };
+
             _logger.LogDebug(
                 "[Homeostasis] Pulse recorded. Duration={DurationMs}ms, Success={Success}, " +
                 "Stress={Stress:F3}, Fatigue={Fatigue:F3}, Overload={Overload:F3}, FailStreak={FailStreak}",
                 (long)durationMs, success, _stressLevel, _fatigueLevel, _overloadLevel, _failureStreak);
         }
+
+        // Publish outside lock — non-blocking fire-and-forget
+        _ = _bus.PublishAsync(busEvent);
     }
 
     public bool IsOverloaded
@@ -179,29 +224,50 @@ public sealed class Homeostasis : IHomeostasis, IStressInjector
         if (string.IsNullOrWhiteSpace(envelope.Source))
             return StressInjectionReceipt.Rejected("unknown", envelope.Severity, "Source must be provided.");
 
+        AutonomicStressEvent busEvent;
+
         lock (_lock)
         {
             ApplyExternalStressUnsafe(envelope);
             _lastUpdatedUtc = DateTimeOffset.UtcNow;
+
+            busEvent = new AutonomicStressEvent
+            {
+                OccurredAtUtc = DateTimeOffset.UtcNow,
+                Source = envelope.Source,
+                Kind = "external_stress",
+                Severity = envelope.Severity,
+                Tags = envelope.Tags,
+                Message = envelope.Message,
+                Metrics = envelope.Metrics,
+                StressLevel = _stressLevel,
+                FatigueLevel = _fatigueLevel,
+                OverloadLevel = _overloadLevel,
+                FailureStreak = _failureStreak
+            };
         }
 
         _logger.LogInformation(
             "[Homeostasis] Stress injected via IStressInjector. Source={Source}, Severity={Severity}",
             envelope.Source, envelope.Severity);
 
+        // Publish outside lock — non-blocking fire-and-forget
+        _ = _bus.PublishAsync(busEvent);
+
         return StressInjectionReceipt.Ok(envelope.Source, envelope.Severity);
     }
 
-    // ─── Autonomic Event Log (read-only access) ─────────────────────
+    // ─── Recent Event Cache (small in-memory observability window) ──
 
     /// <summary>
     /// Returns a snapshot of recent autonomic events, newest first.
+    /// This is a small cache for observability; durable history lives in the Kidneys (DB).
     /// </summary>
-    public IReadOnlyList<AutonomicEvent> GetRecentEvents(int maxCount = 100)
+    public IReadOnlyList<AutonomicEventRecord> GetRecentEvents(int maxCount = 100)
     {
         lock (_lock)
         {
-            return _eventLog.Take(Math.Min(maxCount, _eventLog.Count)).ToList().AsReadOnly();
+            return _recentEventCache.Take(Math.Min(maxCount, _recentEventCache.Count)).ToList().AsReadOnly();
         }
     }
 
@@ -220,8 +286,8 @@ public sealed class Homeostasis : IHomeostasis, IStressInjector
         while (_recentStressSources.Count > MaxRecentStressSources)
             _recentStressSources.RemoveLast();
 
-        // Record as autonomic event
-        RecordEventUnsafe(new AutonomicEvent
+        // Cache for observability
+        CacheEventUnsafe(new AutonomicEventRecord
         {
             TimestampUtc = DateTimeOffset.UtcNow,
             Source = envelope.Source,
@@ -237,18 +303,12 @@ public sealed class Homeostasis : IHomeostasis, IStressInjector
             envelope.Source, envelope.Severity, _stressLevel);
     }
 
-    private void RecordEventUnsafe(AutonomicEvent evt)
+    private void CacheEventUnsafe(AutonomicEventRecord evt)
     {
-        _eventLog.AddFirst(evt);
+        _recentEventCache.AddFirst(evt);
 
-        // Enforce max count
-        while (_eventLog.Count > MaxEventLogCount)
-            _eventLog.RemoveLast();
-
-        // Enforce max age (prune tail — events are newest-first)
-        var cutoff = DateTimeOffset.UtcNow - MaxEventAge;
-        while (_eventLog.Count > 0 && _eventLog.Last!.Value.TimestampUtc < cutoff)
-            _eventLog.RemoveLast();
+        while (_recentEventCache.Count > MaxRecentEventCacheCount)
+            _recentEventCache.RemoveLast();
     }
 
     private bool IsOverloadedUnsafe => _overloadLevel >= OverloadThreshold;
