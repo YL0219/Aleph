@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Globalization;
@@ -18,6 +19,8 @@ public sealed class Axiom : IAxiom
     private readonly McpToolInvoker _mcpInvoker;
     private readonly McpToolSchemaAdapter _mcpSchemaAdapter;
     private readonly ISkillRegistry _skillRegistry;
+    private readonly IAlephBus _bus;
+    private readonly IHostEnvironment _env;
     private readonly ILogger<Axiom> _logger;
 
     public IAxiom.IPythonRouter Python { get; }
@@ -37,6 +40,8 @@ public sealed class Axiom : IAxiom
         McpToolInvoker mcpInvoker,
         McpToolSchemaAdapter mcpSchemaAdapter,
         ISkillRegistry skillRegistry,
+        IAlephBus bus,
+        IHostEnvironment env,
         ILogger<Axiom> logger)
     {
         _dbFactory = dbFactory;
@@ -46,6 +51,8 @@ public sealed class Axiom : IAxiom
         _mcpInvoker = mcpInvoker;
         _mcpSchemaAdapter = mcpSchemaAdapter;
         _skillRegistry = skillRegistry;
+        _bus = bus;
+        _env = env;
         _logger = logger;
 
         Python = new PythonRouterGateway(this);
@@ -104,6 +111,15 @@ public sealed class Axiom : IAxiom
     {
         private static readonly TimeSpan CacheTtl = TimeSpan.FromSeconds(10);
         private const int PythonTimeoutMs = 30_000;
+        private const int IngestionTimeoutMs = 90_000;
+        private const int ParquetReadTimeoutMs = 30_000;
+        private const string DataLakeRelativePath = "data_lake/market/ohlcv";
+
+        /// <summary>Staleness threshold — local data older than this triggers a live refresh.</summary>
+        private static readonly TimeSpan StalenessThreshold = TimeSpan.FromHours(18);
+
+        /// <summary>Per-symbol+interval fetch gate to prevent duplicate concurrent live fetches.</summary>
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _fetchGates = new();
 
         private readonly Axiom _root;
 
@@ -237,6 +253,331 @@ public sealed class Axiom : IAxiom
                 _root._logger.LogWarning(ex, "[Market] JSON parse error for candles {Symbol}", symbol);
                 return new MarketCandlesFetchResult(false, null, "Invalid response from data fetcher.");
             }
+        }
+
+        // ─── On-Demand Perception ────────────────────────────────────
+
+        public async Task<MarketPerceptionResult> PerceiveQuoteAsync(
+            string symbol,
+            CancellationToken ct = default)
+        {
+            if (!SymbolValidator.TryNormalize(symbol, out var normalized))
+                return new MarketPerceptionResult
+                {
+                    Success = false,
+                    Symbol = symbol ?? "",
+                    HistorySource = MarketHistorySource.Missing,
+                    ErrorMessage = "Invalid symbol."
+                };
+
+            // Try live quote
+            var quoteResult = await GetQuoteAsync(normalized, ct);
+            if (quoteResult.Success && quoteResult.Quote is not null)
+            {
+                // Publish market data event
+                _ = _root._bus.PublishAsync(new MarketDataEvent
+                {
+                    OccurredAtUtc = DateTimeOffset.UtcNow,
+                    Source = "Axiom.Market",
+                    Kind = "market_perception",
+                    Severity = PulseSeverity.Normal,
+                    Symbol = normalized,
+                    Interval = "quote",
+                    Success = true,
+                    SourceKind = "live_quote_overlay",
+                    LatestPrice = quoteResult.Quote.Price,
+                    QuoteTimestampUtc = quoteResult.Quote.TimestampUtc
+                });
+
+                return new MarketPerceptionResult
+                {
+                    Success = true,
+                    Symbol = normalized,
+                    HistorySource = MarketHistorySource.Local,
+                    QuoteOverlay = quoteResult.Quote,
+                    LiveFetchOccurred = true
+                };
+            }
+
+            return new MarketPerceptionResult
+            {
+                Success = false,
+                Symbol = normalized,
+                HistorySource = MarketHistorySource.Missing,
+                ErrorMessage = quoteResult.ErrorMessage ?? "Quote fetch failed.",
+                LiveFetchOccurred = true
+            };
+        }
+
+        public async Task<MarketPerceptionResult> PerceiveCandlesAsync(
+            MarketPerceptionRequest request,
+            CancellationToken ct = default)
+        {
+            if (request is null)
+                throw new ArgumentNullException(nameof(request));
+
+            if (!SymbolValidator.TryNormalize(request.Symbol, out var symbol))
+                return new MarketPerceptionResult
+                {
+                    Success = false,
+                    Symbol = request.Symbol ?? "",
+                    HistorySource = MarketHistorySource.Missing,
+                    ErrorMessage = "Invalid symbol."
+                };
+
+            var interval = request.Interval ?? "1d";
+            var gateKey = $"{symbol}:{interval}";
+            var gate = _fetchGates.GetOrAdd(gateKey, _ => new SemaphoreSlim(1, 1));
+
+            await gate.WaitAsync(ct);
+            try
+            {
+                return await PerceiveCandlesInternalAsync(symbol, interval, request.LookbackDays, ct);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+
+        private async Task<MarketPerceptionResult> PerceiveCandlesInternalAsync(
+            string symbol,
+            string interval,
+            int lookbackDays,
+            CancellationToken ct)
+        {
+            var warnings = new List<string>();
+
+            // ── A) Check local parquet data ──
+            var (localAsset, localDataJson, localRowCount) = await ReadLocalHistoryAsync(symbol, interval, lookbackDays, ct);
+            var hasLocalData = localAsset is not null
+                               && !string.IsNullOrWhiteSpace(localDataJson)
+                               && localRowCount > 0;
+
+            var isStale = localAsset?.LastIngestedAtUtc is null
+                          || (DateTime.UtcNow - localAsset.LastIngestedAtUtc.Value) > StalenessThreshold;
+
+            // ── B) Local data is fresh — return with optional live quote overlay ──
+            if (hasLocalData && !isStale)
+            {
+                _root._logger.LogDebug("[Perception] {Symbol}/{Interval}: local data fresh ({Rows} rows).", symbol, interval, localRowCount);
+
+                var quoteOverlay = await TryGetQuoteOverlayAsync(symbol, warnings, ct);
+
+                if (quoteOverlay is not null)
+                {
+                    _ = _root._bus.PublishAsync(new MarketDataEvent
+                    {
+                        OccurredAtUtc = DateTimeOffset.UtcNow,
+                        Source = "Axiom.Market",
+                        Kind = "market_perception",
+                        Severity = PulseSeverity.Normal,
+                        Symbol = symbol,
+                        Interval = interval,
+                        Success = true,
+                        SourceKind = "live_quote_overlay",
+                        LatestPrice = quoteOverlay.Price,
+                        QuoteTimestampUtc = quoteOverlay.TimestampUtc
+                    });
+                }
+
+                return new MarketPerceptionResult
+                {
+                    Success = true,
+                    Symbol = symbol,
+                    HistorySource = MarketHistorySource.Local,
+                    LocalDataJson = localDataJson,
+                    LocalRowCount = localRowCount,
+                    LocalDataAsOfUtc = localAsset!.LastIngestedAtUtc,
+                    ParquetPath = localAsset.ParquetPath,
+                    QuoteOverlay = quoteOverlay,
+                    LiveFetchOccurred = quoteOverlay is not null,
+                    Warnings = warnings
+                };
+            }
+
+            // ── C) Local data missing or stale — perform on-demand live fetch ──
+            var sourceKind = hasLocalData ? "live_refresh" : "live_bootstrap";
+            _root._logger.LogInformation(
+                "[Perception] {Symbol}/{Interval}: {Source} (local={HasLocal}, stale={IsStale}).",
+                symbol, interval, sourceKind, hasLocalData, isStale);
+
+            if (!_root._pythonDispatcher.IsAvailable)
+            {
+                if (hasLocalData)
+                {
+                    warnings.Add("Python not available for live refresh; returning stale local data.");
+                    return new MarketPerceptionResult
+                    {
+                        Success = true,
+                        Symbol = symbol,
+                        HistorySource = MarketHistorySource.Local,
+                        LocalDataJson = localDataJson,
+                        LocalRowCount = localRowCount,
+                        LocalDataAsOfUtc = localAsset?.LastIngestedAtUtc,
+                        ParquetPath = localAsset?.ParquetPath,
+                        Warnings = warnings
+                    };
+                }
+
+                return new MarketPerceptionResult
+                {
+                    Success = false,
+                    Symbol = symbol,
+                    HistorySource = MarketHistorySource.Missing,
+                    ErrorMessage = "Python not available and no local data exists."
+                };
+            }
+
+            // ── D) Run ingestion for this single symbol ──
+            var outRoot = DataLakeRelativePath;
+            var ingestionResult = await _root.MarketIngestion.RunIngestionBatchAsync(
+                new[] { symbol }, interval, lookbackDays, outRoot, ct);
+
+            if (ingestionResult.Success && ingestionResult.Report is not null)
+            {
+                // Persist metadata
+                await _root.MarketIngestion.ApplyIngestionBatchAsync(
+                    new[] { symbol }, interval, ingestionResult, ct);
+
+                // Re-read fresh local data
+                var (freshAsset, freshJson, freshRows) = await ReadLocalHistoryAsync(symbol, interval, lookbackDays, ct);
+                var quoteOverlay = await TryGetQuoteOverlayAsync(symbol, warnings, ct);
+
+                var successResult = ingestionResult.Report.Results.FirstOrDefault(r =>
+                    r.Symbol.Equals(symbol, StringComparison.OrdinalIgnoreCase) && r.IsSuccess);
+
+                // Publish MarketDataEvent
+                _ = _root._bus.PublishAsync(new MarketDataEvent
+                {
+                    OccurredAtUtc = DateTimeOffset.UtcNow,
+                    Source = "Axiom.Market",
+                    Kind = "market_perception",
+                    Severity = PulseSeverity.Normal,
+                    Symbol = symbol,
+                    Interval = interval,
+                    Success = true,
+                    SourceKind = sourceKind,
+                    RowsWritten = successResult?.RowsWritten,
+                    ParquetPath = successResult?.ParquetPath,
+                    LatestPrice = quoteOverlay?.Price,
+                    QuoteTimestampUtc = quoteOverlay?.TimestampUtc
+                });
+
+                return new MarketPerceptionResult
+                {
+                    Success = true,
+                    Symbol = symbol,
+                    HistorySource = hasLocalData ? MarketHistorySource.LiveRefresh : MarketHistorySource.LiveBootstrap,
+                    LocalDataJson = freshJson,
+                    LocalRowCount = freshRows,
+                    LocalDataAsOfUtc = freshAsset?.LastIngestedAtUtc ?? DateTime.UtcNow,
+                    ParquetPath = successResult?.ParquetPath ?? freshAsset?.ParquetPath,
+                    QuoteOverlay = quoteOverlay,
+                    LiveFetchOccurred = true,
+                    DataPersisted = true,
+                    Warnings = warnings
+                };
+            }
+
+            // ── E) Live fetch failed — fall back to stale local if available ──
+            if (hasLocalData)
+            {
+                warnings.Add($"Live fetch failed: {ingestionResult.ErrorMessage ?? "unknown"}. Returning stale local data.");
+                return new MarketPerceptionResult
+                {
+                    Success = true,
+                    Symbol = symbol,
+                    HistorySource = MarketHistorySource.Local,
+                    LocalDataJson = localDataJson,
+                    LocalRowCount = localRowCount,
+                    LocalDataAsOfUtc = localAsset?.LastIngestedAtUtc,
+                    ParquetPath = localAsset?.ParquetPath,
+                    LiveFetchOccurred = true,
+                    Warnings = warnings
+                };
+            }
+
+            return new MarketPerceptionResult
+            {
+                Success = false,
+                Symbol = symbol,
+                HistorySource = MarketHistorySource.Missing,
+                ErrorMessage = ingestionResult.ErrorMessage ?? "Live fetch failed and no local data available.",
+                LiveFetchOccurred = true
+            };
+        }
+
+        /// <summary>Read local parquet history for a symbol via Python parquet_read.</summary>
+        private async Task<(MarketDataAsset? Asset, string? DataJson, int RowCount)> ReadLocalHistoryAsync(
+            string symbol, string interval, int days, CancellationToken ct)
+        {
+            // Check metadata first
+            await using var db = await _root._dbFactory.CreateDbContextAsync(ct);
+            var asset = await db.MarketDataAssets
+                .AsNoTracking()
+                .FirstOrDefaultAsync(a => a.Symbol == symbol && a.Interval == interval, ct);
+
+            if (asset is null || string.IsNullOrWhiteSpace(asset.ParquetPath))
+                return (null, null, 0);
+
+            if (!_root._pythonDispatcher.IsAvailable)
+                return (asset, null, 0);
+
+            // Read parquet via Python
+            var absoluteDataRoot = Path.GetFullPath(
+                Path.Combine(_root._env.ContentRootPath, DataLakeRelativePath)).Replace("\\", "/");
+
+            var result = await _root._pythonDispatcher.RunParquetReadAsync(
+                symbol, Math.Max(days, 5), absoluteDataRoot, ParquetReadTimeoutMs, ct);
+
+            if (!result.Success || string.IsNullOrWhiteSpace(result.Stdout))
+                return (asset, null, 0);
+
+            // Extract JSON safely
+            var jsonPayload = result.Stdout;
+            var jsonStartIndex = jsonPayload.IndexOf('{');
+            if (jsonStartIndex < 0)
+                return (asset, null, 0);
+
+            jsonPayload = jsonPayload.Substring(jsonStartIndex);
+
+            // Try to extract row count from JSON
+            int rowCount = 0;
+            try
+            {
+                using var doc = JsonDocument.Parse(jsonPayload);
+                if (doc.RootElement.TryGetProperty("rows", out var rowsProp))
+                    rowCount = rowsProp.GetInt32();
+                else if (doc.RootElement.TryGetProperty("data", out var dataProp) && dataProp.ValueKind == JsonValueKind.Array)
+                    rowCount = dataProp.GetArrayLength();
+            }
+            catch (JsonException)
+            {
+                // Non-fatal — we still have the JSON string
+            }
+
+            return (asset, jsonPayload, rowCount);
+        }
+
+        /// <summary>Try to get a live quote overlay. Non-fatal on failure.</summary>
+        private async Task<MarketQuoteDto?> TryGetQuoteOverlayAsync(
+            string symbol, List<string> warnings, CancellationToken ct)
+        {
+            try
+            {
+                var quoteResult = await GetQuoteAsync(symbol, ct);
+                if (quoteResult.Success && quoteResult.Quote is not null)
+                    return quoteResult.Quote;
+
+                warnings.Add($"Quote overlay failed: {quoteResult.ErrorMessage ?? "unknown"}");
+            }
+            catch (Exception ex)
+            {
+                warnings.Add($"Quote overlay exception: {ex.Message}");
+            }
+
+            return null;
         }
 
         private async Task<(bool Success, string StdoutJson, string ErrorMessage)> RunFetcherAsync(

@@ -49,14 +49,21 @@ public sealed record HeartbeatPulseEvent : AlephEvent
 }
 
 /// <summary>
-/// Blood cell representing a market data ingestion event.
-/// Type defined now as foundation; publishing/consumption NOT wired in this phase.
+/// Blood cell representing a market data perception event.
+/// Published by the Axiom market gateway when live market data enters the bloodstream.
 /// </summary>
 public sealed record MarketDataEvent : AlephEvent
 {
     public required string Symbol { get; init; }
     public required string Interval { get; init; }
     public required bool Success { get; init; }
+
+    /// <summary>How the data was sourced: live_bootstrap, live_refresh, live_quote_overlay.</summary>
+    public required string SourceKind { get; init; }
+
     public int? RowsWritten { get; init; }
+    public string? ParquetPath { get; init; }
     public string? ErrorMessage { get; init; }
+    public double? LatestPrice { get; init; }
+    public string? QuoteTimestampUtc { get; init; }
 }

@@ -33,6 +33,23 @@ public interface IAxiom
         Task<MarketCandlesFetchResult> GetCandlesAsync(
             MarketCandlesQuery query,
             CancellationToken ct = default);
+
+        /// <summary>
+        /// On-demand perception: get-or-fetch a live quote with local-first + live overlay.
+        /// Never adds the symbol to the background watchlist.
+        /// </summary>
+        Task<MarketPerceptionResult> PerceiveQuoteAsync(
+            string symbol,
+            CancellationToken ct = default);
+
+        /// <summary>
+        /// On-demand perception: get-or-fetch candle history with local-first + live bootstrap.
+        /// If local history is missing, performs a live fetch and persists to data lake.
+        /// Never adds the symbol to the background watchlist.
+        /// </summary>
+        Task<MarketPerceptionResult> PerceiveCandlesAsync(
+            MarketPerceptionRequest request,
+            CancellationToken ct = default);
     }
 
     public interface IMarketIngestionGateway
@@ -204,3 +221,63 @@ public sealed record MarketIngestionRunResult(
     bool Success,
     IngestionReport? Report,
     string? ErrorMessage);
+
+// ── On-Demand Perception Contracts ──────────────────────────────
+
+/// <summary>Request for on-demand candle perception.</summary>
+public sealed record MarketPerceptionRequest
+{
+    public required string Symbol { get; init; }
+    public string Interval { get; init; } = "1d";
+    public int LookbackDays { get; init; } = 90;
+}
+
+/// <summary>How the historical data was sourced.</summary>
+public enum MarketHistorySource
+{
+    /// <summary>Data came from the local parquet data lake.</summary>
+    Local,
+    /// <summary>Data was freshly fetched and persisted (first time for this symbol).</summary>
+    LiveBootstrap,
+    /// <summary>Local data existed but was refreshed from live source.</summary>
+    LiveRefresh,
+    /// <summary>No historical data available.</summary>
+    Missing
+}
+
+/// <summary>
+/// Result of an on-demand market perception request.
+/// Contains local history status, optional live quote overlay, and warnings.
+/// </summary>
+public sealed record MarketPerceptionResult
+{
+    public required bool Success { get; init; }
+    public required string Symbol { get; init; }
+    public required MarketHistorySource HistorySource { get; init; }
+
+    /// <summary>Local parquet data (JSON candles) if available.</summary>
+    public string? LocalDataJson { get; init; }
+
+    /// <summary>Number of rows in local history.</summary>
+    public int? LocalRowCount { get; init; }
+
+    /// <summary>When the local data was last ingested.</summary>
+    public DateTime? LocalDataAsOfUtc { get; init; }
+
+    /// <summary>Parquet file path if data was persisted.</summary>
+    public string? ParquetPath { get; init; }
+
+    /// <summary>Live quote overlay (latest price snapshot).</summary>
+    public MarketQuoteDto? QuoteOverlay { get; init; }
+
+    /// <summary>Whether a live fetch was performed in this request.</summary>
+    public bool LiveFetchOccurred { get; init; }
+
+    /// <summary>Whether data was persisted to the data lake in this request.</summary>
+    public bool DataPersisted { get; init; }
+
+    /// <summary>Non-fatal warnings (e.g. quote overlay failed but local data available).</summary>
+    public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
+
+    public string? ErrorMessage { get; init; }
+}

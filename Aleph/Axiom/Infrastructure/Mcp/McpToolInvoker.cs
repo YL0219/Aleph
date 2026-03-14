@@ -30,6 +30,9 @@ namespace Aleph
                 ["query_local_market_data"] = new(
                     IsStateChanging: false,
                     Handler: InvokeQueryLocalMarketDataAsync),
+                ["perceive_market_data"] = new(
+                    IsStateChanging: false,
+                    Handler: InvokePerceiveMarketDataAsync),
                 ["execute_trade"] = new(
                     IsStateChanging: true,
                     Handler: InvokeExecuteTradeAsync),
@@ -128,6 +131,29 @@ namespace Aleph
 
             var marketTools = ResolveTool<McpMarketTools>();
             string content = await marketTools.QueryLocalMarketData(symbol, days);
+            return InferSuccess(content)
+                ? McpToolResult.Success(content)
+                : McpToolResult.Failure(content);
+        }
+
+        private async Task<McpToolResult> InvokePerceiveMarketDataAsync(
+            JsonElement root,
+            CancellationToken ct)
+        {
+            if (!TryGetRequiredString(root, "symbol", out string symbol, out string err))
+                return BuildInvokerFailure(err);
+
+            int days = 90;
+            if (root.TryGetProperty("days", out var daysProp))
+            {
+                if (!TryReadInt(daysProp, out days))
+                    return BuildInvokerFailure("Argument 'days' must be an integer.");
+            }
+
+            string interval = TryGetOptionalString(root, "interval") ?? "1d";
+
+            var marketTools = ResolveTool<McpMarketTools>();
+            string content = await marketTools.PerceiveMarketData(symbol, days, interval);
             return InferSuccess(content)
                 ? McpToolResult.Success(content)
                 : McpToolResult.Failure(content);
