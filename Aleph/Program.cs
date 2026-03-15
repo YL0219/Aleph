@@ -76,6 +76,7 @@ builder.Services.AddSingleton<McpExecutionTools>();
 builder.Services.AddSingleton<McpNewsTools>();
 builder.Services.AddSingleton<McpSkillTools>();
 builder.Services.AddSingleton<McpAetherTools>();
+builder.Services.AddSingleton<IMcpToolRegistry, McpToolRegistry>();
 builder.Services.AddSingleton<McpToolSchemaAdapter>();
 builder.Services.AddSingleton<McpToolInvoker>();
 
