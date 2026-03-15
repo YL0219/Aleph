@@ -57,6 +57,10 @@ builder.Services.AddHostedService<HeartbeatService>();
 // Kidneys — background persistence consumer for autonomic/heartbeat events.
 builder.Services.AddHostedService<AutonomicPersistenceService>();
 
+// Liver — metabolic processing organ. Digests MarketDataEvent → MetabolicEvent.
+builder.Services.AddSingleton<MetabolicArtifactWriter>();
+builder.Services.AddHostedService<LiverService>();
+
 builder.Services
     .AddMcpServer(options =>
     {
