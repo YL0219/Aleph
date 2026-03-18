@@ -60,7 +60,25 @@ public sealed record MetabolicEvent : AlephEvent
 
     /// <summary>Path where the metabolized artifact was persisted.</summary>
     public string? MetabolizedArtifactPath { get; init; }
+
+    // ─── Temporal Envelope (anti-leakage / point-in-time safety) ─────
+
+    /// <summary>Temporal provenance proving point-in-time safety for training eligibility.</summary>
+    public MetabolicTemporalEnvelope? Temporal { get; init; }
+
+    // ─── Macro Context (cross-asset, scheduled, headline, crypto) ────
+
+    /// <summary>Macro-aware context enrichment. Nullable because not all events carry macro data.</summary>
+    public MetabolicMacroContext? MacroContext { get; init; }
+
+    // ─── Context Coverage (observability of what was/wasn't available) ─
+
+    public MetabolicContextCoverage? ContextCoverage { get; init; }
 }
+
+// ═════════════════════════════════════════════════════════════════════
+// Existing nested records (unchanged)
+// ═════════════════════════════════════════════════════════════════════
 
 /// <summary>
 /// Canonical baseline technical indicators at a single point in time.
@@ -143,4 +161,120 @@ public sealed record MetabolicRecentWindows
     public IReadOnlyList<double?>? Rsi14 { get; init; }
     public IReadOnlyList<double?>? MacdHistogram { get; init; }
     public IReadOnlyList<double?>? AtrPct { get; init; }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// NEW: Temporal Envelope — anti-leakage provenance
+// ═════════════════════════════════════════════════════════════════════
+
+/// <summary>
+/// Temporal provenance envelope proving point-in-time safety.
+/// A sample is only eligible for training if PointInTimeSafe == true.
+/// Rule: every included context item must have KnowledgeUtc &lt;= ObservationCutoffUtc.
+/// </summary>
+public sealed record MetabolicTemporalEnvelope
+{
+    public required string BarOpenUtc { get; init; }
+    public required string BarCloseUtc { get; init; }
+    public required string ObservationCutoffUtc { get; init; }
+    public required string FeatureBuiltUtc { get; init; }
+    public required string MaxIncludedKnowledgeUtc { get; init; }
+    public required string TemporalPolicyVersion { get; init; }
+    public required bool PointInTimeSafe { get; init; }
+    public bool HistoricalReplayMode { get; init; }
+    public IReadOnlyList<string> ExclusionReasons { get; init; } = Array.Empty<string>();
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// NEW: Macro Context — cross-asset, scheduled, headline, crypto
+// ═════════════════════════════════════════════════════════════════════
+
+/// <summary>
+/// Macro-aware context enrichment carried as compact scores/tags only.
+/// No raw news text — only refs, tags, and pre-computed scores.
+/// </summary>
+public sealed record MetabolicMacroContext
+{
+    public MetabolicCrossAssetSnapshot? CrossAsset { get; init; }
+    public MetabolicScheduledContext? Scheduled { get; init; }
+    public MetabolicHeadlineContext? Headlines { get; init; }
+    public MetabolicCryptoStressContext? CryptoStress { get; init; }
+    public MetabolicRegimeHints? RegimeHints { get; init; }
+    public IReadOnlyList<string> MacroTags { get; init; } = Array.Empty<string>();
+}
+
+public sealed record MetabolicCrossAssetSnapshot
+{
+    public required string AsOfUtc { get; init; }
+    public double? EquitiesRiskScore { get; init; }
+    public double? BondsRiskScore { get; init; }
+    public double? GoldStrengthScore { get; init; }
+    public double? SilverStrengthScore { get; init; }
+    public double? DollarPressureScore { get; init; }
+    public double? VolatilityPressureScore { get; init; }
+    public double? CryptoRiskScore { get; init; }
+    public double? LiquidityStressScore { get; init; }
+    public double? CorrelationStressScore { get; init; }
+    public double? CoverageScore { get; init; }
+}
+
+public sealed record MetabolicScheduledContext
+{
+    public IReadOnlyList<MetabolicKnownCatalyst> UpcomingCatalysts { get; init; } = Array.Empty<MetabolicKnownCatalyst>();
+    public bool HighPriorityEventWithin24h { get; init; }
+    public double? ScheduleTensionScore { get; init; }
+    public double? CalendarCoverageScore { get; init; }
+}
+
+public sealed record MetabolicKnownCatalyst
+{
+    public required string CatalystId { get; init; }
+    public required string EventType { get; init; }
+    public required string ScheduledForUtc { get; init; }
+    public required string KnowledgeUtc { get; init; }
+    public required double PriorityProbability { get; init; }
+    public IReadOnlyList<string> ExpectedAffectedAssets { get; init; } = Array.Empty<string>();
+}
+
+public sealed record MetabolicHeadlineContext
+{
+    public IReadOnlyList<string> ActiveTags { get; init; } = Array.Empty<string>();
+    public IReadOnlyList<string> HeadlineRefs { get; init; } = Array.Empty<string>();
+    public int HeadlineCount { get; init; }
+    public double? MaterialityScore { get; init; }
+    public double? ShockScore { get; init; }
+    public double? SourceDiversityScore { get; init; }
+    public string? MaxIncludedKnowledgeUtc { get; init; }
+}
+
+public sealed record MetabolicCryptoStressContext
+{
+    public required string AsOfUtc { get; init; }
+    public double? CryptoRiskScore { get; init; }
+    public double? CryptoVolatilityScore { get; init; }
+    public double? WeekendStressScore { get; init; }
+    public double? StablecoinStressScore { get; init; }
+}
+
+public sealed record MetabolicRegimeHints
+{
+    public double? RiskOnProbability { get; init; }
+    public double? RiskOffProbability { get; init; }
+    public double? InflationPressureProbability { get; init; }
+    public double? GrowthScareProbability { get; init; }
+    public double? PolicyShockProbability { get; init; }
+    public double? FlightToSafetyProbability { get; init; }
+    public double? RegimeConfidence { get; init; }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// NEW: Context Coverage — observability of what was/wasn't available
+// ═════════════════════════════════════════════════════════════════════
+
+public sealed record MetabolicContextCoverage
+{
+    public bool HadHeadlineContext { get; init; }
+    public bool HadScheduledContext { get; init; }
+    public bool HadCryptoContext { get; init; }
+    public IReadOnlyList<string> MissingContextReasons { get; init; } = Array.Empty<string>();
 }

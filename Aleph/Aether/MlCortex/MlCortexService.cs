@@ -12,13 +12,19 @@ namespace Aleph;
 /// Design principles:
 ///   - C# is thin plumbing only — all ML logic lives in Python
 ///   - Real-time inference path is always available (even cold start)
-///   - Heavier training path is gated by Homeostasis (Calm/DeepWork only)
+///   - Training is NOT performed here; it lives in the Sleep Cycle path
 ///   - Multi-horizon-ready architecture, v1 uses a single configured horizon
 ///   - Hot-swappable: Python brain can be replaced without C# changes
+///   - Temporal security enforced: unsafe samples blocked from training memory
 /// </summary>
 public sealed class MlCortexService : BackgroundService, IAlephOrgan
 {
     private const int PredictionTimeoutMs = 30_000;
+    private const string DefaultModelKey = "cortex_sgd_1h_24bar";
+    private const string DefaultFeatureVersion = "v2.0.0";
+    private const string DefaultTemporalPolicyVersion = "tp_v1";
+    private const int DefaultHorizonBars = 24;
+    private const string DefaultInterval = "1h";
 
     private readonly IAlephBus _bus;
     private readonly IAether _aether;
@@ -38,6 +44,15 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
     /// <summary>The active horizon key for v1. Configurable, defaults to "1d".</summary>
     private string ActiveHorizon { get; }
 
+    private string ModelKey { get; }
+    private string FeatureVersion { get; }
+    private int HorizonBars { get; }
+
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+    };
+
     public MlCortexService(
         IAlephBus bus,
         IAether aether,
@@ -52,6 +67,9 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
         _logger = logger;
 
         ActiveHorizon = configuration["Aether:Cortex:ActiveHorizon"] ?? "1d";
+        ModelKey = configuration["Aether:Cortex:ModelKey"] ?? DefaultModelKey;
+        FeatureVersion = configuration["Aether:Cortex:FeatureVersion"] ?? DefaultFeatureVersion;
+        HorizonBars = int.TryParse(configuration["Aether:Cortex:HorizonBars"], out var hb) ? hb : DefaultHorizonBars;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -106,19 +124,35 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
             "[MlCortex] Processing {Symbol}/{Interval} (metabolic event {EventId}).",
             me.Symbol, me.Interval, me.EventId);
 
-        // ── Step 1: Build the ML input payload from the MetabolicEvent ──
-        var metabolicPayloadJson = BuildMetabolicPayload(me);
+        // ── Step 1: Determine temporal safety and governance ──
+        var temporal = me.Temporal;
+        var pointInTimeSafe = temporal?.PointInTimeSafe ?? true; // default safe if no temporal envelope yet
+        var observationCutoffUtc = temporal?.ObservationCutoffUtc ?? me.AsOfUtc;
 
-        // ── Step 2: Determine if training is allowed this cycle ──
         var snapshot = _homeostasis.GetSnapshot();
-        var trainingAllowed = !_homeostasis.IsOverloaded && !_homeostasis.IsBreathless
-            && snapshot.StressLevel < 0.5 && snapshot.FatigueLevel < 0.5;
+        var isOverloaded = _homeostasis.IsOverloaded;
+        var isBreathless = _homeostasis.IsBreathless;
+
+        // Governance: determine training eligibility
+        var learningBlockReasons = new List<string>();
+        if (!pointInTimeSafe)
+            learningBlockReasons.Add("temporal_safety_failed");
+        if (isOverloaded)
+            learningBlockReasons.Add("system_overloaded");
+        if (isBreathless)
+            learningBlockReasons.Add("system_breathless");
+
+        var eligibleForTraining = learningBlockReasons.Count == 0;
+
+        // ── Step 2: Build the nested ML input payload ──
+        var metabolicPayloadJson = BuildMetabolicPayload(me, snapshot, isOverloaded, isBreathless,
+            eligibleForTraining, learningBlockReasons);
 
         // ── Step 3: Call IAether.Ml.CortexPredictAsync ──
         var request = new MlCortexPredictRequest
         {
             Symbol = me.Symbol,
-            Interval = me.Interval,
+            Interval = DefaultInterval,
             ActiveHorizon = ActiveHorizon,
             AsOfUtc = me.AsOfUtc,
             MetabolicPayloadJson = metabolicPayloadJson
@@ -152,7 +186,7 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
         PredictionEvent? predictionEvent;
         try
         {
-            predictionEvent = ParsePredictionOutput(me, result.PayloadJson);
+            predictionEvent = ParsePredictionOutput(me, result.PayloadJson, observationCutoffUtc);
         }
         catch (Exception ex)
         {
@@ -169,92 +203,270 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
         await _bus.PublishAsync(predictionEvent, ct);
 
         _logger.LogInformation(
-            "[MlCortex] {Symbol}/{Interval} → {Class} Conf={Confidence:F3} Tend={Tendency:F3} ({State})",
+            "[MlCortex] {Symbol}/{Interval} → {Class} Conf={Confidence:F3} Tend={Tendency:F3} ({State}) Safe={Safe}",
             me.Symbol, me.Interval,
             predictionEvent.PredictedClass, predictionEvent.Confidence,
-            predictionEvent.ActionTendency, predictionEvent.ModelState);
+            predictionEvent.ActionTendency, predictionEvent.ModelState,
+            predictionEvent.TemporalSecurityPassed);
     }
 
-    /// <summary>
-    /// Serialize the metabolic features into a compact JSON payload for the Python brain.
-    /// Extracts only the fields the ML pipeline needs — keeps the boundary thin.
-    /// </summary>
-    private static string BuildMetabolicPayload(MetabolicEvent me)
+    // ═════════════════════════════════════════════════════════════════
+    // Payload Builder — nested JSON contract for Python brain
+    // ═════════════════════════════════════════════════════════════════
+
+    private string BuildMetabolicPayload(
+        MetabolicEvent me,
+        HomeostasisSnapshot snapshot,
+        bool isOverloaded,
+        bool isBreathless,
+        bool eligibleForTraining,
+        List<string> learningBlockReasons)
     {
+        var temporal = me.Temporal;
+        var macro = me.MacroContext;
+
         var payload = new Dictionary<string, object?>
         {
-            ["symbol"] = me.Symbol,
-            ["interval"] = me.Interval,
-            ["asof_utc"] = me.AsOfUtc,
-            ["source_event_id"] = me.EventId.ToString(),
+            // ── meta ──
+            ["meta"] = new Dictionary<string, object?>
+            {
+                ["symbol"] = me.Symbol,
+                ["interval"] = me.Interval,
+                ["asof_utc"] = me.AsOfUtc,
+                ["source_event_id"] = me.EventId.ToString(),
+                ["metabolic_version"] = me.MetabolicVersion,
+                ["model_key"] = ModelKey,
+                ["feature_version"] = FeatureVersion,
+                ["active_horizon"] = ActiveHorizon,
+                ["horizon_bars"] = HorizonBars,
+            },
+
+            // ── temporal ──
+            ["temporal"] = new Dictionary<string, object?>
+            {
+                ["bar_open_utc"] = temporal?.BarOpenUtc,
+                ["bar_close_utc"] = temporal?.BarCloseUtc,
+                ["observation_cutoff_utc"] = temporal?.ObservationCutoffUtc ?? me.AsOfUtc,
+                ["max_included_knowledge_utc"] = temporal?.MaxIncludedKnowledgeUtc,
+                ["point_in_time_safe"] = temporal?.PointInTimeSafe ?? true,
+                ["temporal_policy_version"] = temporal?.TemporalPolicyVersion ?? DefaultTemporalPolicyVersion,
+                ["historical_replay_mode"] = temporal?.HistoricalReplayMode ?? false,
+                ["exclusion_reasons"] = temporal?.ExclusionReasons ?? (IReadOnlyList<string>)Array.Empty<string>(),
+            },
+
+            // ── technical ──
+            ["technical"] = BuildTechnicalSection(me),
+
+            // ── macro ──
+            ["macro"] = BuildMacroSection(macro),
+
+            // ── events ──
+            ["events"] = BuildEventsSection(macro),
+
+            // ── homeostasis ──
+            ["homeostasis"] = new Dictionary<string, object?>
+            {
+                ["stress_level"] = snapshot.StressLevel,
+                ["fatigue_level"] = snapshot.FatigueLevel,
+                ["is_overloaded"] = isOverloaded,
+                ["is_breathless"] = isBreathless,
+            },
+
+            // ── governance ──
+            ["governance"] = new Dictionary<string, object?>
+            {
+                ["eligible_for_prediction"] = true,
+                ["eligible_for_training"] = eligibleForTraining,
+                ["learning_block_reasons"] = learningBlockReasons,
+            },
+        };
+
+        return JsonSerializer.Serialize(payload, JsonOpts);
+    }
+
+    private static Dictionary<string, object?> BuildTechnicalSection(MetabolicEvent me)
+    {
+        var snap = me.Snapshot;
+        var fs = me.FactorScores;
+        var comp = me.Composite;
+
+        var section = new Dictionary<string, object?>
+        {
             ["bias"] = me.Bias,
             ["confidence"] = me.Confidence,
             ["row_count"] = me.RowCount,
             ["enough_for_long_trend"] = me.EnoughForLongTrend,
         };
 
-        // Snapshot features
-        var snap = me.Snapshot;
+        // Snapshot
         if (snap is not null)
         {
-            payload["price"] = snap.Price;
-            payload["sma_20"] = snap.Sma20;
-            payload["sma_50"] = snap.Sma50;
-            payload["sma_200"] = snap.Sma200;
-            payload["ema_12"] = snap.Ema12;
-            payload["ema_26"] = snap.Ema26;
-            payload["rsi_14"] = snap.Rsi14;
-            payload["atr_14"] = snap.Atr14;
-            payload["atr_pct"] = snap.AtrPct;
-            payload["volatility_20"] = snap.Volatility20;
-            payload["volume_sma_20"] = snap.VolumeSma20;
-            payload["dist_sma_20"] = snap.DistSma20;
-            payload["dist_sma_50"] = snap.DistSma50;
-            payload["dist_sma_200"] = snap.DistSma200;
+            section["price"] = snap.Price;
+            section["sma_20"] = snap.Sma20;
+            section["sma_50"] = snap.Sma50;
+            section["sma_200"] = snap.Sma200;
+            section["ema_12"] = snap.Ema12;
+            section["ema_26"] = snap.Ema26;
+            section["rsi_14"] = snap.Rsi14;
+            section["atr_14"] = snap.Atr14;
+            section["atr_pct"] = snap.AtrPct;
+            section["volatility_20"] = snap.Volatility20;
+            section["volume_sma_20"] = snap.VolumeSma20;
+            section["dist_sma_20"] = snap.DistSma20;
+            section["dist_sma_50"] = snap.DistSma50;
+            section["dist_sma_200"] = snap.DistSma200;
 
             if (snap.Macd is not null)
             {
-                payload["macd_line"] = snap.Macd.Line;
-                payload["macd_signal"] = snap.Macd.Signal;
-                payload["macd_histogram"] = snap.Macd.Histogram;
+                section["macd_line"] = snap.Macd.Line;
+                section["macd_signal"] = snap.Macd.Signal;
+                section["macd_histogram"] = snap.Macd.Histogram;
             }
 
             if (snap.Bollinger is not null)
             {
-                payload["bb_bandwidth"] = snap.Bollinger.Bandwidth;
+                section["bb_bandwidth"] = snap.Bollinger.Bandwidth;
             }
         }
 
-        // Factor scores
-        var fs = me.FactorScores;
+        // Factor scores grouped
         if (fs is not null)
         {
-            payload["factor_trend"] = fs.Trend.Score;
-            payload["factor_momentum"] = fs.Momentum.Score;
-            payload["factor_volatility"] = fs.Volatility.Score;
-            payload["factor_participation"] = fs.Participation.Score;
+            section["factors"] = new Dictionary<string, object?>
+            {
+                ["trend"] = fs.Trend.Score,
+                ["momentum"] = fs.Momentum.Score,
+                ["volatility"] = fs.Volatility.Score,
+                ["participation"] = fs.Participation.Score,
+            };
         }
 
-        // Composite probabilities
-        var comp = me.Composite;
+        // Composite probabilities grouped
         if (comp is not null)
         {
-            payload["composite_bullish"] = comp.BullishProbability;
-            payload["composite_bearish"] = comp.BearishProbability;
-            payload["composite_neutral"] = comp.NeutralProbability;
-            payload["composite_confidence"] = comp.Confidence;
+            section["composite"] = new Dictionary<string, object?>
+            {
+                ["bullish"] = comp.BullishProbability,
+                ["bearish"] = comp.BearishProbability,
+                ["neutral"] = comp.NeutralProbability,
+                ["confidence"] = comp.Confidence,
+            };
         }
 
-        return JsonSerializer.Serialize(payload, new JsonSerializerOptions
-        {
-            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
-        });
+        return section;
     }
 
-    /// <summary>
-    /// Parse the Python brain's JSON output into a PredictionEvent blood cell.
-    /// </summary>
-    private PredictionEvent? ParsePredictionOutput(MetabolicEvent source, string payloadJson)
+    private static Dictionary<string, object?> BuildMacroSection(MetabolicMacroContext? macro)
+    {
+        var section = new Dictionary<string, object?>();
+
+        if (macro is null)
+            return section;
+
+        // Cross-asset scores
+        var ca = macro.CrossAsset;
+        if (ca is not null)
+        {
+            section["cross_asset"] = new Dictionary<string, object?>
+            {
+                ["as_of_utc"] = ca.AsOfUtc,
+                ["equities_risk"] = ca.EquitiesRiskScore,
+                ["bonds_risk"] = ca.BondsRiskScore,
+                ["gold_strength"] = ca.GoldStrengthScore,
+                ["silver_strength"] = ca.SilverStrengthScore,
+                ["dollar_pressure"] = ca.DollarPressureScore,
+                ["volatility_pressure"] = ca.VolatilityPressureScore,
+                ["crypto_risk"] = ca.CryptoRiskScore,
+                ["liquidity_stress"] = ca.LiquidityStressScore,
+                ["correlation_stress"] = ca.CorrelationStressScore,
+                ["coverage"] = ca.CoverageScore,
+            };
+        }
+
+        // Regime hints
+        var rh = macro.RegimeHints;
+        if (rh is not null)
+        {
+            section["regime_hints"] = new Dictionary<string, object?>
+            {
+                ["risk_on"] = rh.RiskOnProbability,
+                ["risk_off"] = rh.RiskOffProbability,
+                ["inflation_pressure"] = rh.InflationPressureProbability,
+                ["growth_scare"] = rh.GrowthScareProbability,
+                ["policy_shock"] = rh.PolicyShockProbability,
+                ["flight_to_safety"] = rh.FlightToSafetyProbability,
+                ["confidence"] = rh.RegimeConfidence,
+            };
+        }
+
+        section["macro_tags"] = macro.MacroTags;
+
+        return section;
+    }
+
+    private static Dictionary<string, object?> BuildEventsSection(MetabolicMacroContext? macro)
+    {
+        var section = new Dictionary<string, object?>();
+
+        if (macro is null)
+            return section;
+
+        // Scheduled catalysts
+        var sched = macro.Scheduled;
+        if (sched is not null)
+        {
+            var catalysts = new List<Dictionary<string, object?>>();
+            foreach (var c in sched.UpcomingCatalysts)
+            {
+                catalysts.Add(new Dictionary<string, object?>
+                {
+                    ["event_type"] = c.EventType,
+                    ["scheduled_for_utc"] = c.ScheduledForUtc,
+                    ["knowledge_utc"] = c.KnowledgeUtc,
+                    ["priority_probability"] = c.PriorityProbability,
+                    ["affected_assets"] = c.ExpectedAffectedAssets,
+                });
+            }
+            section["scheduled_catalysts"] = catalysts;
+            section["high_priority_within_24h"] = sched.HighPriorityEventWithin24h;
+            section["schedule_tension"] = sched.ScheduleTensionScore;
+        }
+
+        // Headlines
+        var hl = macro.Headlines;
+        if (hl is not null)
+        {
+            section["headline_tags"] = hl.ActiveTags;
+            section["headline_refs"] = hl.HeadlineRefs;
+            section["headline_count"] = hl.HeadlineCount;
+            section["materiality"] = hl.MaterialityScore;
+            section["shock"] = hl.ShockScore;
+            section["source_diversity"] = hl.SourceDiversityScore;
+            section["headline_knowledge_utc"] = hl.MaxIncludedKnowledgeUtc;
+        }
+
+        // Crypto stress
+        var cs = macro.CryptoStress;
+        if (cs is not null)
+        {
+            section["crypto_stress"] = new Dictionary<string, object?>
+            {
+                ["as_of_utc"] = cs.AsOfUtc,
+                ["risk"] = cs.CryptoRiskScore,
+                ["volatility"] = cs.CryptoVolatilityScore,
+                ["weekend_stress"] = cs.WeekendStressScore,
+                ["stablecoin_stress"] = cs.StablecoinStressScore,
+            };
+        }
+
+        return section;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // Prediction Parser — reads expanded Python output
+    // ═════════════════════════════════════════════════════════════════
+
+    private PredictionEvent? ParsePredictionOutput(MetabolicEvent source, string payloadJson, string observationCutoffUtc)
     {
         using var doc = JsonDocument.Parse(payloadJson);
         var root = doc.RootElement;
@@ -268,16 +480,23 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
             return null;
         }
 
+        // Core fields
+        var predictionId = SafeStr(root, "prediction_id") ?? Guid.NewGuid().ToString("N");
         var predClass = SafeStr(root, "predicted_class") ?? "neutral";
         var modelState = SafeStr(root, "model_state") ?? "cold_start";
         var modelVersion = SafeStr(root, "model_version") ?? "v1.0.0";
+        var modelKey = SafeStr(root, "model_key") ?? ModelKey;
+        var featureVersion = SafeStr(root, "feature_version") ?? FeatureVersion;
         var confidence = SafeDbl(root, "confidence");
         var actionTendency = SafeDbl(root, "action_tendency");
         var trainedSamples = SafeInt(root, "trained_samples");
         var pendingStored = SafeBool(root, "pending_sample_stored");
         var trainingOccurred = SafeBool(root, "training_occurred");
+        var temporalSecurityPassed = SafeBool(root, "temporal_security_passed", fallback: true);
+        var eligibleForTraining = SafeBool(root, "eligible_for_training") && temporalSecurityPassed;
+        var priorityScore = SafeNullDbl(root, "priority_score");
 
-        // Parse probabilities
+        // Probabilities
         double pBullish = 0.33, pNeutral = 0.34, pBearish = 0.33;
         if (root.TryGetProperty("probabilities", out var probEl) && probEl.ValueKind == JsonValueKind.Object)
         {
@@ -286,17 +505,58 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
             pBearish = SafeDbl(probEl, "bearish", 0.33);
         }
 
-        // Parse warnings
-        var warnings = new List<string>();
-        if (root.TryGetProperty("warnings", out var warnArr) && warnArr.ValueKind == JsonValueKind.Array)
+        // Regime probabilities
+        PredictionRegimeProbabilities? regimeProbs = null;
+        if (root.TryGetProperty("regime_probabilities", out var rpEl) && rpEl.ValueKind == JsonValueKind.Object)
         {
-            foreach (var w in warnArr.EnumerateArray())
+            regimeProbs = new PredictionRegimeProbabilities
             {
-                var ws = w.GetString();
-                if (!string.IsNullOrWhiteSpace(ws))
-                    warnings.Add(ws);
+                RiskOn = SafeDbl(rpEl, "risk_on"),
+                RiskOff = SafeDbl(rpEl, "risk_off"),
+                InflationPressure = SafeDbl(rpEl, "inflation_pressure"),
+                GrowthScare = SafeDbl(rpEl, "growth_scare"),
+                PolicyShock = SafeDbl(rpEl, "policy_shock"),
+                FlightToSafety = SafeDbl(rpEl, "flight_to_safety"),
+            };
+        }
+
+        // Event probabilities
+        PredictionEventProbabilities? eventProbs = null;
+        if (root.TryGetProperty("event_probabilities", out var epEl) && epEl.ValueKind == JsonValueKind.Object)
+        {
+            eventProbs = new PredictionEventProbabilities
+            {
+                Materiality = SafeDbl(epEl, "materiality"),
+                FollowThrough = SafeDbl(epEl, "follow_through"),
+                VolatilityExpansion = SafeDbl(epEl, "volatility_expansion"),
+            };
+        }
+
+        // Top drivers / risks
+        var topDrivers = ParseStringArray(root, "top_drivers");
+        var topRisks = ParseStringArray(root, "top_risks");
+
+        // Watched catalysts
+        var watchedCatalysts = new List<PredictionCatalystRef>();
+        if (root.TryGetProperty("watched_catalysts", out var wcArr) && wcArr.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var wc in wcArr.EnumerateArray())
+            {
+                if (wc.ValueKind != JsonValueKind.Object) continue;
+                var et = SafeStr(wc, "event_type");
+                var sf = SafeStr(wc, "scheduled_for_utc");
+                if (et is null || sf is null) continue;
+                watchedCatalysts.Add(new PredictionCatalystRef
+                {
+                    EventType = et,
+                    ScheduledForUtc = sf,
+                    ImportanceProbability = SafeDbl(wc, "importance_probability"),
+                });
             }
         }
+
+        // Warnings
+        var warnings = ParseStringArray(root, "warnings");
 
         return new PredictionEvent
         {
@@ -308,12 +568,20 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
             CorrelationId = source.CorrelationId,
             CausationId = source.EventId,
 
+            PredictionId = predictionId,
             Symbol = source.Symbol,
             Interval = source.Interval,
             ActiveHorizon = ActiveHorizon,
             AsOfUtc = source.AsOfUtc,
             SourceMetabolicEventId = source.EventId,
             ModelVersion = modelVersion,
+            ModelKey = modelKey,
+            FeatureVersion = featureVersion,
+
+            SourceObservationCutoffUtc = observationCutoffUtc,
+            TemporalSecurityPassed = temporalSecurityPassed,
+            EligibleForTraining = eligibleForTraining,
+
             ModelState = modelState,
             TrainedSamples = trainedSamples,
 
@@ -327,13 +595,20 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
             Confidence = confidence,
             ActionTendency = actionTendency,
 
+            RegimeProbabilities = regimeProbs,
+            EventProbabilities = eventProbs,
+            PriorityScore = priorityScore,
+            TopDrivers = topDrivers,
+            TopRisks = topRisks,
+            WatchedCatalysts = watchedCatalysts.AsReadOnly(),
+
             PendingSampleStored = pendingStored,
             TrainingOccurred = trainingOccurred,
-            Warnings = warnings.AsReadOnly(),
+            Warnings = warnings,
         };
     }
 
-    // ─── Minimal JSON helpers ────────────────────────────────────────
+    // ─── JSON helpers ────────────────────────────────────────────────
 
     private static string? SafeStr(JsonElement el, string prop)
     {
@@ -349,6 +624,13 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
             : fallback;
     }
 
+    private static double? SafeNullDbl(JsonElement el, string prop)
+    {
+        return el.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.Number
+            ? v.GetDouble()
+            : null;
+    }
+
     private static int SafeInt(JsonElement el, string prop)
     {
         return el.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.Number
@@ -356,9 +638,25 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
             : 0;
     }
 
-    private static bool SafeBool(JsonElement el, string prop)
+    private static bool SafeBool(JsonElement el, string prop, bool fallback = false)
     {
         return el.TryGetProperty(prop, out var v) && v.ValueKind is JsonValueKind.True or JsonValueKind.False
-            && v.GetBoolean();
+            ? v.GetBoolean()
+            : fallback;
+    }
+
+    private static IReadOnlyList<string> ParseStringArray(JsonElement el, string prop)
+    {
+        if (!el.TryGetProperty(prop, out var arr) || arr.ValueKind != JsonValueKind.Array)
+            return Array.Empty<string>();
+
+        var list = new List<string>();
+        foreach (var item in arr.EnumerateArray())
+        {
+            var s = item.GetString();
+            if (!string.IsNullOrWhiteSpace(s))
+                list.Add(s);
+        }
+        return list.AsReadOnly();
     }
 }
