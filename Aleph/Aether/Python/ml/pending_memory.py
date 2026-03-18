@@ -1,13 +1,18 @@
 """
-pending_memory.py - Store/load pending unresolved samples for delayed labeling.
+pending_memory.py — Complete lifecycle for pending/resolved prediction memory.
 
-v2: Expanded schema for Phase 9.5 — prediction_id, model_key, temporal
-security metadata, regime/event probabilities, eligibility tracking.
+v3: Full lifecycle with:
+  - pending.jsonl   — active unresolved queue
+  - resolved.jsonl  — append-only truth archive
+  - atomic pending rewrite after resolve (unresolved stay, resolved move out)
+  - rich resolved record schema with full provenance and grading sidecars
 
 Storage layout:
   data_lake/cortex/pending/{symbol}/{horizon}/pending.jsonl
   data_lake/cortex/resolved/{symbol}/{horizon}/resolved.jsonl
 """
+
+from __future__ import annotations
 
 import json
 import os
@@ -31,6 +36,10 @@ def _pending_path(symbol: str, horizon: str) -> Path:
 def _resolved_path(symbol: str, horizon: str) -> Path:
     return _cortex_root() / "resolved" / symbol.upper() / horizon / "resolved.jsonl"
 
+
+# ═══════════════════════════════════════════════════════════════════
+# PENDING STORAGE
+# ═══════════════════════════════════════════════════════════════════
 
 def store_pending_sample(
     symbol: str,
@@ -112,7 +121,7 @@ def store_pending_sample(
         return False
 
 
-def load_pending_samples(symbol: str, horizon: str, max_samples: int = 1000) -> list[dict]:
+def load_pending_samples(symbol: str, horizon: str, max_samples: int = 10000) -> list[dict]:
     """Load pending (unresolved) samples."""
     path = _pending_path(symbol, horizon)
     if not path.exists():
@@ -145,6 +154,37 @@ def load_eligible_pending_samples(symbol: str, horizon: str, max_samples: int = 
     return [s for s in all_pending if s.get("eligible_for_training", True)][:max_samples]
 
 
+# ═══════════════════════════════════════════════════════════════════
+# RESOLVED STORAGE (APPEND-ONLY TRUTH ARCHIVE)
+# ═══════════════════════════════════════════════════════════════════
+
+def append_resolved_samples(
+    symbol: str,
+    horizon: str,
+    resolved_records: list[dict],
+) -> int:
+    """
+    Append resolved records to the truth archive.
+    Returns count of successfully written records.
+    """
+    if not resolved_records:
+        return 0
+
+    path = _resolved_path(symbol, horizon)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    try:
+        with open(path, "a") as f:
+            for record in resolved_records:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+                written += 1
+    except Exception as ex:
+        print(f"[MlCortex] Failed to append resolved samples: {ex}", file=sys.stderr)
+
+    return written
+
+
 def store_resolved_sample(
     symbol: str,
     horizon: str,
@@ -152,7 +192,6 @@ def store_resolved_sample(
     label: str,
     asof_utc: str,
     resolution_utc: str | None = None,
-    # v2 expanded fields
     prediction_id: str = "",
     model_key: str = "",
     feature_version: str = "",
@@ -162,11 +201,8 @@ def store_resolved_sample(
     label_policy_version: str = "",
     resolved_without_lookahead: bool = True,
 ) -> bool:
-    """Store a resolved (labeled) sample for training."""
-    path = _resolved_path(symbol, horizon)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    sample = {
+    """Legacy single-sample resolved store (backward compat). Prefer append_resolved_samples."""
+    record = {
         "prediction_id": prediction_id,
         "asof_utc": asof_utc,
         "resolution_utc": resolution_utc or datetime.now(timezone.utc).isoformat(),
@@ -176,24 +212,21 @@ def store_resolved_sample(
         "feature_version": feature_version,
         "features": features,
         "label": label,
+        "actual_label": label,
         "target_bar_utc": target_bar_utc,
         "target_price": target_price,
         "future_return_bps": future_return_bps,
+        "realized_return_bps": future_return_bps,
         "label_policy_version": label_policy_version,
         "resolved_without_lookahead": resolved_without_lookahead,
+        "eligible_for_training": True,
+        "learning_block_reasons": [],
     }
-
-    try:
-        with open(path, "a") as f:
-            f.write(json.dumps(sample, separators=(",", ":")) + "\n")
-        return True
-    except Exception as ex:
-        print(f"[MlCortex] Failed to store resolved sample: {ex}", file=sys.stderr)
-        return False
+    return append_resolved_samples(symbol, horizon, [record]) == 1
 
 
-def load_resolved_samples(symbol: str, horizon: str, max_samples: int = 10000) -> list[dict]:
-    """Load resolved (labeled) samples for training."""
+def load_resolved_samples(symbol: str, horizon: str, max_samples: int = 50000) -> list[dict]:
+    """Load resolved (labeled) samples from the truth archive."""
     path = _resolved_path(symbol, horizon)
     if not path.exists():
         return []
@@ -216,6 +249,112 @@ def load_resolved_samples(symbol: str, horizon: str, max_samples: int = 10000) -
 
     return samples
 
+
+def load_resolved_since_cursor(
+    symbol: str,
+    horizon: str,
+    consumed_ids: set[str],
+    max_samples: int = 10000,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Load resolved samples, splitting into:
+      - fresh: prediction_id NOT in consumed_ids
+      - replay_pool: prediction_id IS in consumed_ids (already trained)
+
+    Returns (fresh, replay_pool).
+    """
+    all_resolved = load_resolved_samples(symbol, horizon, max_samples=max_samples)
+    fresh = []
+    replay = []
+    for s in all_resolved:
+        pid = s.get("prediction_id", "")
+        if pid and pid in consumed_ids:
+            replay.append(s)
+        else:
+            fresh.append(s)
+    return fresh, replay
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ATOMIC PENDING REWRITE
+# ═══════════════════════════════════════════════════════════════════
+
+def rewrite_pending_after_resolve(
+    symbol: str,
+    horizon: str,
+    resolved_ids: set[str],
+    expired_ids: set[str] | None = None,
+) -> dict:
+    """
+    Atomically rewrite pending.jsonl:
+      - Remove samples whose prediction_id is in resolved_ids or expired_ids
+      - Keep all other unresolved samples
+
+    Uses write-to-tmp-then-rename for safety.
+
+    Returns:
+      {"kept": int, "removed": int, "expired": int}
+    """
+    path = _pending_path(symbol, horizon)
+    expired_ids = expired_ids or set()
+    all_remove = resolved_ids | expired_ids
+
+    if not path.exists():
+        return {"kept": 0, "removed": 0, "expired": 0}
+
+    # Read all lines
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+    except Exception as ex:
+        print(f"[MlCortex] Failed to read pending for rewrite: {ex}", file=sys.stderr)
+        return {"kept": 0, "removed": 0, "expired": 0}
+
+    kept_lines = []
+    removed = 0
+    expired_count = 0
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            sample = json.loads(line)
+            pid = sample.get("prediction_id", "")
+            if pid in all_remove:
+                if pid in expired_ids:
+                    expired_count += 1
+                else:
+                    removed += 1
+                continue
+            kept_lines.append(line)
+        except json.JSONDecodeError:
+            # Drop malformed lines
+            continue
+
+    # Write atomically
+    tmp_path = path.with_suffix(".tmp")
+    try:
+        with open(tmp_path, "w") as f:
+            for line in kept_lines:
+                f.write(line + "\n")
+        if os.name == "nt" and path.exists():
+            os.remove(path)
+        os.rename(tmp_path, path)
+    except Exception as ex:
+        print(f"[MlCortex] Failed to rewrite pending: {ex}", file=sys.stderr)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return {"kept": len(kept_lines), "removed": 0, "expired": 0}
+
+    return {"kept": len(kept_lines), "removed": removed, "expired": expired_count}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# COUNTING HELPERS
+# ═══════════════════════════════════════════════════════════════════
 
 def pending_count(symbol: str, horizon: str) -> int:
     """Count pending samples without loading them all."""
@@ -273,3 +412,15 @@ def pending_blocked_count(symbol: str, horizon: str) -> int:
     except Exception:
         pass
     return blocked
+
+
+def resolved_count(symbol: str, horizon: str) -> int:
+    """Count resolved samples."""
+    path = _resolved_path(symbol, horizon)
+    if not path.exists():
+        return 0
+    try:
+        with open(path, "r") as f:
+            return sum(1 for line in f if line.strip())
+    except Exception:
+        return 0

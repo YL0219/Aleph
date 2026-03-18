@@ -1,12 +1,19 @@
 """
-prediction_formatter.py - Normalized output contract for the Python brain.
+prediction_formatter.py — Normalized output contract for the Python brain.
 
-v2: Expanded for Phase 9.5 — prediction_id, model_key, feature_version,
-temporal security, regime/event probabilities, priority score, drivers/risks.
+v3: Expanded for Phase 9 learning loop — adds format_resolve and format_controlled_train
+alongside the existing predict/status/train formatters.
+
+All functions return a dict that gets serialized to JSON by the router.
+Every output has {ok, domain, action} as the root envelope.
 """
 
 from .feature_adapter import FEATURE_VERSION
 
+
+# ═══════════════════════════════════════════════════════════════════
+# PREDICTION OUTPUT
+# ═══════════════════════════════════════════════════════════════════
 
 def format_prediction(
     predicted_class: str,
@@ -33,7 +40,7 @@ def format_prediction(
     training_occurred: bool = False,
     warnings: list[str] | None = None,
 ) -> dict:
-    """Build the normalized prediction output dict (v2 contract)."""
+    """Build the normalized prediction output dict."""
     regime = regime_probabilities or {}
     event = event_probabilities or {}
 
@@ -87,6 +94,10 @@ def format_prediction(
     }
 
 
+# ═══════════════════════════════════════════════════════════════════
+# STATUS OUTPUT
+# ═══════════════════════════════════════════════════════════════════
+
 def format_status(
     symbol: str,
     horizon: str,
@@ -103,8 +114,12 @@ def format_status(
     temporal_policy_version: str = "",
     last_train_utc: str | None = None,
     class_distribution: dict | None = None,
+    # v3 fields
+    cursor_sequence: int = 0,
+    total_samples_ever_trained: int = 0,
+    active_policies: dict | None = None,
 ) -> dict:
-    """Build the normalized status output dict (v2 contract)."""
+    """Build the normalized status output dict."""
     return {
         "ok": True,
         "domain": "ml",
@@ -123,8 +138,65 @@ def format_status(
         "temporal_policy_version": temporal_policy_version,
         "last_train_utc": last_train_utc,
         "class_distribution": class_distribution or {},
+        "cursor_sequence": cursor_sequence,
+        "total_samples_ever_trained": total_samples_ever_trained,
+        "active_policies": active_policies or {},
     }
 
+
+# ═══════════════════════════════════════════════════════════════════
+# RESOLVE OUTPUT
+# ═══════════════════════════════════════════════════════════════════
+
+def format_resolve(
+    symbol: str,
+    horizon: str,
+    resolution_summary: dict,
+    pending_rewrite_result: dict | None = None,
+    warnings: list[str] | None = None,
+) -> dict:
+    """Build the normalized resolve output dict."""
+    return {
+        "ok": True,
+        "domain": "ml",
+        "action": "cortex_resolve",
+        "symbol": symbol,
+        "horizon": horizon,
+        "resolution": resolution_summary,
+        "pending_rewrite": pending_rewrite_result or {},
+        "warnings": warnings or [],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CONTROLLED TRAIN OUTPUT
+# ═══════════════════════════════════════════════════════════════════
+
+def format_controlled_train(
+    symbol: str,
+    horizon: str,
+    train_result: dict,
+    cursor_sequence: int = 0,
+    consumed_count: int = 0,
+    warnings: list[str] | None = None,
+) -> dict:
+    """Build the normalized controlled-train output dict."""
+    return {
+        "ok": True,
+        "domain": "ml",
+        "action": "cortex_train",
+        "symbol": symbol,
+        "horizon": horizon,
+        "training": train_result,
+        "cursor_sequence": cursor_sequence,
+        "consumed_count": consumed_count,
+        "warnings": warnings or [],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LEGACY TRAIN OUTPUT (backward compat)
+# ═══════════════════════════════════════════════════════════════════
 
 def format_train_result(
     symbol: str,
@@ -134,7 +206,7 @@ def format_train_result(
     model_version: str,
     trained_samples: int,
 ) -> dict:
-    """Build the normalized training result output dict."""
+    """Build the legacy training result output dict."""
     return {
         "ok": True,
         "domain": "ml",

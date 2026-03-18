@@ -35,6 +35,13 @@ public interface IAether
         /// Cortex status — model state, sample counts, version info.
         /// </summary>
         Task<AetherJsonResult> CortexStatusAsync(MlCortexStatusRequest request, CancellationToken ct = default);
+
+        /// <summary>
+        /// Cortex resolve — scan pending memory, resolve mature predictions
+        /// against parquet truth, produce labeled training data.
+        /// Should only be called during sleep/calm windows.
+        /// </summary>
+        Task<AetherJsonResult> CortexResolveAsync(MlCortexResolveRequest request, CancellationToken ct = default);
     }
 
     public interface ISimGateway
@@ -141,4 +148,14 @@ public sealed record MlCortexStatusRequest
 {
     public string? Symbol { get; init; }
     public string ActiveHorizon { get; init; } = "1d";
+}
+
+/// <summary>
+/// Request for Cortex resolve — resolve pending predictions against parquet truth.
+/// </summary>
+public sealed record MlCortexResolveRequest
+{
+    public required string Symbol { get; init; }
+    public string ActiveHorizon { get; init; } = "1d";
+    public string Interval { get; init; } = "1h";
 }

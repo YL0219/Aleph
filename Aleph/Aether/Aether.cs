@@ -241,6 +241,25 @@ public sealed class Aether : IAether
 
             return _root.RunAsync("ml", "cortex_status", args, DefaultTimeoutMs, ct);
         }
+
+        public Task<AetherJsonResult> CortexResolveAsync(MlCortexResolveRequest request, CancellationToken ct = default)
+        {
+            if (request is null)
+                throw new ArgumentNullException(nameof(request));
+
+            var symbol = NormalizeSymbol(request.Symbol);
+            if (string.IsNullOrWhiteSpace(symbol))
+                return Task.FromResult(new AetherJsonResult(false, string.Empty, "Invalid symbol format.", -1, false));
+
+            var args = new List<string>
+            {
+                "--symbol", symbol,
+                "--horizon", string.IsNullOrWhiteSpace(request.ActiveHorizon) ? "1d" : request.ActiveHorizon.Trim().ToLowerInvariant(),
+                "--interval", string.IsNullOrWhiteSpace(request.Interval) ? "1h" : request.Interval.Trim().ToLowerInvariant()
+            };
+
+            return _root.RunAsync("ml", "cortex_resolve", args, 120_000, ct);
+        }
     }
 
     private sealed class SimGateway : IAether.ISimGateway

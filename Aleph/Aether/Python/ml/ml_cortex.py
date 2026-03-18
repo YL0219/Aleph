@@ -1,31 +1,56 @@
 """
-ml_cortex.py - Main entrypoint for the ML Cortex Python brain.
+ml_cortex.py — Main orchestrator for the ML Cortex Python brain.
 
-v2: Reads nested metabolic payload, enforces temporal security,
-returns expanded prediction contract with regime/event probabilities.
-
-Called by ml_manager.py for cortex_predict, cortex_train, cortex_status actions.
-Routes to the appropriate brain subsystem and returns a normalized JSON dict.
+v3: Full learning-loop with four verbs:
+  - cortex_predict  — real-time inference (always available, even cold start)
+  - cortex_resolve  — resolve pending predictions against parquet truth
+  - cortex_train    — cursor-aware policy-driven incremental training
+  - cortex_status   — model/memory/cursor diagnostics
 
 All stdout output = exactly one JSON object.
 All logs go to stderr.
 """
 
+from __future__ import annotations
+
+import os
 import sys
 import uuid
+from pathlib import Path
 
 from .feature_adapter import extract_features, has_meaningful_features, FEATURE_VERSION
 from .brain_state import load_model, save_model
 from .temporal_security import check_temporal_safety, compute_eligibility
+from .policies import (
+    DEFAULT_LABEL_POLICY, DEFAULT_RESOLUTION_POLICY, DEFAULT_TRAINING_POLICY,
+    get_active_policies,
+)
+from .training_cursor import load_cursor, save_cursor
 from .pending_memory import (
     store_pending_sample,
+    load_pending_samples,
     load_resolved_samples,
+    load_resolved_since_cursor,
+    append_resolved_samples,
+    rewrite_pending_after_resolve,
     pending_count as get_pending_count,
     pending_eligible_count as get_pending_eligible_count,
     pending_blocked_count as get_pending_blocked_count,
+    resolved_count as get_resolved_count,
 )
-from .prediction_formatter import format_prediction, format_status, format_train_result
+from .label_resolver import resolve_pending_batch
+from .prediction_formatter import (
+    format_prediction,
+    format_status,
+    format_resolve,
+    format_controlled_train,
+    format_train_result,
+)
 
+
+# ═══════════════════════════════════════════════════════════════════
+# VERB 1: PREDICT (real-time inference)
+# ═══════════════════════════════════════════════════════════════════
 
 def cortex_predict(symbol: str, interval: str, horizon: str, asof_utc: str, payload: dict) -> dict:
     """
@@ -167,7 +192,7 @@ def cortex_predict(symbol: str, interval: str, horizon: str, asof_utc: str, payl
         source_event_id=source_event_id,
     )
 
-    # ── Build watched catalysts (pass through from events) ──
+    # ── Build watched catalysts ──
     watched_catalysts = []
     if isinstance(events, dict):
         for cat in events.get("scheduled_catalysts", []):
@@ -200,78 +225,200 @@ def cortex_predict(symbol: str, interval: str, horizon: str, asof_utc: str, payl
     )
 
 
-def cortex_train(symbol: str, horizon: str, max_samples: int = 100) -> dict:
-    """
-    Incremental training path. Uses resolved samples to partial_fit the model.
-    Should only be called during Calm/DeepWork windows.
-    """
-    model = load_model(symbol, horizon)
-    print(f"[MlCortex] Train {symbol}/{horizon} — loading resolved samples", file=sys.stderr)
+# ═══════════════════════════════════════════════════════════════════
+# VERB 2: RESOLVE (delayed label resolution against parquet truth)
+# ═══════════════════════════════════════════════════════════════════
 
-    # Load resolved (labeled) samples
-    resolved = load_resolved_samples(symbol, horizon, max_samples=max_samples)
+def cortex_resolve(symbol: str, horizon: str, interval: str = "1h") -> dict:
+    """
+    Resolve mature pending predictions against realized market truth.
 
-    if not resolved:
-        print(f"[MlCortex] No resolved samples for {symbol}/{horizon}", file=sys.stderr)
-        return format_train_result(
-            symbol=symbol,
-            horizon=horizon,
-            samples_fitted=0,
-            model_state=model.model_state,
-            model_version=model.model_version,
-            trained_samples=model.trained_samples,
+    Steps:
+      1. Load pending samples
+      2. Load OHLCV parquet truth for this symbol/interval
+      3. Run policy-driven batch resolution (label_resolver)
+      4. Append resolved records to truth archive
+      5. Atomically rewrite pending queue (keep unresolved, remove resolved/expired)
+      6. Return summary
+    """
+    warnings: list[str] = []
+
+    # ── Load pending ──
+    pending = load_pending_samples(symbol, horizon)
+    if not pending:
+        return format_resolve(
+            symbol=symbol, horizon=horizon,
+            resolution_summary={
+                "total_processed": 0, "resolved_count": 0,
+                "deferred_count": 0, "expired_count": 0, "errored_count": 0,
+                "class_distribution": {}, "accuracy": 0.0, "mean_brier_score": 0.0,
+                "label_policy_version": DEFAULT_LABEL_POLICY.version,
+                "resolution_policy_version": DEFAULT_RESOLUTION_POLICY.version,
+                "warnings": ["no_pending_samples"],
+            },
+            warnings=["no_pending_samples"],
         )
 
-    # Extract features and labels from resolved samples
-    features_batch = [s["features"] for s in resolved if "features" in s and "label" in s]
-    labels = [s["label"] for s in resolved if "features" in s and "label" in s]
+    print(f"[MlCortex] Resolve {symbol}/{horizon} — {len(pending)} pending samples", file=sys.stderr)
 
-    if not features_batch:
-        return format_train_result(
-            symbol=symbol,
-            horizon=horizon,
-            samples_fitted=0,
-            model_state=model.model_state,
-            model_version=model.model_version,
-            trained_samples=model.trained_samples,
-        )
+    # ── Load OHLCV truth from parquet ──
+    ohlcv_df = _load_ohlcv_truth(symbol, interval, warnings)
 
-    # Partial fit
-    fitted = model.partial_fit(features_batch, labels)
-    print(f"[MlCortex] Fitted {fitted} samples for {symbol}/{horizon}", file=sys.stderr)
+    # ── Run resolution ──
+    result = resolve_pending_batch(
+        pending_samples=pending,
+        ohlcv_df=ohlcv_df,
+        label_policy=DEFAULT_LABEL_POLICY,
+        resolution_policy=DEFAULT_RESOLUTION_POLICY,
+    )
 
-    # Save updated model
-    save_model(symbol, horizon, model)
+    summary = result.summary()
+    print(
+        f"[MlCortex] Resolution complete: resolved={len(result.resolved)}, "
+        f"deferred={len(result.deferred)}, expired={len(result.expired)}, "
+        f"errored={len(result.errored)}",
+        file=sys.stderr,
+    )
 
-    return format_train_result(
+    # ── Append resolved to truth archive ──
+    if result.resolved:
+        written = append_resolved_samples(symbol, horizon, result.resolved)
+        print(f"[MlCortex] Wrote {written} resolved records to truth archive", file=sys.stderr)
+        if written < len(result.resolved):
+            warnings.append(f"partial_archive_write:{written}/{len(result.resolved)}")
+
+    # ── Rewrite pending queue ──
+    resolved_ids = {r["prediction_id"] for r in result.resolved if r.get("prediction_id")}
+    expired_ids = {s.get("prediction_id", "") for s in result.expired if s.get("prediction_id")}
+
+    rewrite_result = {}
+    if resolved_ids or expired_ids:
+        rewrite_result = rewrite_pending_after_resolve(symbol, horizon, resolved_ids, expired_ids)
+        print(f"[MlCortex] Pending rewrite: {rewrite_result}", file=sys.stderr)
+
+    warnings.extend(result.warnings)
+
+    return format_resolve(
         symbol=symbol,
         horizon=horizon,
-        samples_fitted=fitted,
-        model_state=model.model_state,
-        model_version=model.model_version,
-        trained_samples=model.trained_samples,
+        resolution_summary=summary,
+        pending_rewrite_result=rewrite_result,
+        warnings=warnings,
     )
 
 
-def cortex_status(symbol: str, horizon: str) -> dict:
-    """Get Cortex model status (v2 expanded)."""
+# ═══════════════════════════════════════════════════════════════════
+# VERB 3: TRAIN (cursor-aware policy-driven incremental training)
+# ═══════════════════════════════════════════════════════════════════
+
+def cortex_train(symbol: str, horizon: str, max_samples: int = 200) -> dict:
+    """
+    Incremental training path.
+
+    Steps:
+      1. Load training cursor (what's already been consumed)
+      2. Load resolved samples, split into fresh vs replay
+      3. Load model
+      4. Run controlled_fit with policy-driven batch construction
+      5. Update cursor
+      6. Save model
+      7. Return summary
+    """
+    warnings: list[str] = []
+
+    # ── Load cursor ──
+    cursor = load_cursor(symbol, horizon)
+    print(
+        f"[MlCortex] Train {symbol}/{horizon} — cursor seq={cursor.sequence}, "
+        f"consumed={len(cursor.consumed_ids)}",
+        file=sys.stderr,
+    )
+
+    # ── Load resolved samples split by cursor ──
+    fresh, replay_pool = load_resolved_since_cursor(
+        symbol, horizon,
+        consumed_ids=cursor.consumed_ids,
+        max_samples=max_samples * 3,  # load more for replay pool
+    )
+
+    if not fresh:
+        print(f"[MlCortex] No fresh resolved samples for {symbol}/{horizon}", file=sys.stderr)
+        return format_controlled_train(
+            symbol=symbol, horizon=horizon,
+            train_result={
+                "samples_fitted": 0, "fresh_count": 0, "replay_count": 0,
+                "batch_class_distribution": {},
+                "model_state": "unknown", "model_version": "unknown",
+                "trained_samples_total": 0,
+                "warnings": ["no_fresh_samples"],
+                "drift_flags": [],
+                "policy_version": DEFAULT_TRAINING_POLICY.version,
+            },
+            cursor_sequence=cursor.sequence,
+            consumed_count=len(cursor.consumed_ids),
+            warnings=["no_fresh_resolved_samples"],
+        )
+
+    # ── Load model ──
     model = load_model(symbol, horizon)
+    print(
+        f"[MlCortex] Model loaded: state={model.model_state}, "
+        f"samples={model.trained_samples}",
+        file=sys.stderr,
+    )
+
+    # ── Controlled fit ──
+    train_result = model.controlled_fit(
+        fresh_samples=fresh,
+        replay_samples=replay_pool,
+        policy=DEFAULT_TRAINING_POLICY,
+    )
+
+    print(
+        f"[MlCortex] Training complete: fitted={train_result.samples_fitted}, "
+        f"fresh={train_result.fresh_count}, replay={train_result.replay_count}",
+        file=sys.stderr,
+    )
+
+    # ── Update cursor if training occurred ──
+    if train_result.samples_fitted > 0:
+        # Mark all fresh sample prediction_ids as consumed
+        fresh_ids = [s.get("prediction_id", "") for s in fresh if s.get("prediction_id")]
+        cursor.mark_consumed(fresh_ids, DEFAULT_TRAINING_POLICY.version)
+        cursor.prune_old_ids()
+        save_cursor(cursor)
+
+        # Save updated model
+        save_model(symbol, horizon, model)
+        print(f"[MlCortex] Model and cursor saved. Seq={cursor.sequence}", file=sys.stderr)
+
+    if train_result.drift_flags:
+        warnings.extend([f"drift:{f}" for f in train_result.drift_flags])
+
+    return format_controlled_train(
+        symbol=symbol,
+        horizon=horizon,
+        train_result=train_result.to_dict(),
+        cursor_sequence=cursor.sequence,
+        consumed_count=len(cursor.consumed_ids),
+        warnings=warnings + train_result.warnings,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# VERB 4: STATUS (expanded diagnostics)
+# ═══════════════════════════════════════════════════════════════════
+
+def cortex_status(symbol: str, horizon: str) -> dict:
+    """Get Cortex model/memory/cursor status."""
+    model = load_model(symbol, horizon)
+    cursor = load_cursor(symbol, horizon)
+
     pc = get_pending_count(symbol, horizon)
     pe = get_pending_eligible_count(symbol, horizon)
     pb = get_pending_blocked_count(symbol, horizon)
+    rc = get_resolved_count(symbol, horizon)
 
-    # Resolved count
-    from .pending_memory import _resolved_path
-    rp = _resolved_path(symbol, horizon)
-    rc = 0
-    if rp.exists():
-        try:
-            with open(rp, "r") as f:
-                rc = sum(1 for line in f if line.strip())
-        except Exception:
-            pass
-
-    # Class distribution from model
     class_dist = {}
     if hasattr(model, "class_distribution"):
         class_dist = model.class_distribution()
@@ -289,13 +436,46 @@ def cortex_status(symbol: str, horizon: str) -> dict:
         pending_eligible_count=pe,
         pending_blocked_count=pb,
         temporal_policy_version="tp_v1",
-        last_train_utc=None,
+        last_train_utc=cursor.last_train_utc,
         class_distribution=class_dist,
+        cursor_sequence=cursor.sequence,
+        total_samples_ever_trained=cursor.total_samples_ever,
+        active_policies=get_active_policies(),
     )
 
 
-# ─── Internal helpers ──────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# OHLCV TRUTH LOADER
+# ═══════════════════════════════════════════════════════════════════
 
+def _load_ohlcv_truth(symbol: str, interval: str, warnings: list[str]):
+    """
+    Load OHLCV data from the parquet data lake.
+    Uses the quant/parquet_loader module.
+    """
+    try:
+        # Import parquet_loader from the quant sibling package
+        parent = Path(__file__).resolve().parent.parent
+        quant_path = str(parent / "quant")
+        if quant_path not in sys.path:
+            sys.path.insert(0, str(parent))
+
+        from quant.parquet_loader import load_ohlcv
+        df, load_warnings = load_ohlcv(symbol, timeframe=interval, days=0)
+        if load_warnings:
+            warnings.extend(load_warnings)
+        return df
+    except ImportError as ex:
+        warnings.append(f"parquet_loader_import_error:{ex}")
+        return None
+    except Exception as ex:
+        warnings.append(f"ohlcv_load_error:{ex}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# INTERNAL HELPERS
+# ═══════════════════════════════════════════════════════════════════
 
 def _sf(val) -> float:
     """Safe float conversion."""
@@ -308,11 +488,12 @@ def _sf(val) -> float:
 
 
 def _compute_priority(prediction: dict, regime: dict, events: dict) -> float:
-    """Simple priority score: higher confidence + higher event/regime signals = higher priority."""
+    """Higher confidence + higher event/regime signals = higher priority."""
     conf = prediction.get("confidence", 0.0)
     tend = abs(prediction.get("action_tendency", 0.0))
     event_signal = max(events.get("materiality", 0.0), events.get("shock", 0.0))
-    regime_signal = max(regime.get("risk_off", 0.0), regime.get("policy_shock", 0.0), regime.get("flight_to_safety", 0.0))
+    regime_signal = max(regime.get("risk_off", 0.0), regime.get("policy_shock", 0.0),
+                        regime.get("flight_to_safety", 0.0))
     return round(conf * 0.4 + tend * 0.2 + event_signal * 0.2 + regime_signal * 0.2, 4)
 
 

@@ -18,8 +18,8 @@ def _ok(action, symbol, extra=None):
 
 
 def handle_action(action, argv):
-    # ── Cortex actions (new Phase 8 brain) ──
-    if action in ("cortex_predict", "cortex_train", "cortex_status"):
+    # ── Cortex actions (Phase 8+ brain) ──
+    if action in ("cortex_predict", "cortex_train", "cortex_status", "cortex_resolve"):
         return _handle_cortex(action, argv)
 
     # ── Legacy ML actions ──
@@ -55,7 +55,7 @@ def _handle_cortex(action, argv):
     if router_dir not in sys.path:
         sys.path.insert(0, router_dir)
 
-    from ml.ml_cortex import cortex_predict, cortex_train, cortex_status
+    from ml.ml_cortex import cortex_predict, cortex_train, cortex_status, cortex_resolve
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--symbol", default="")
@@ -90,6 +90,13 @@ def _handle_cortex(action, argv):
             symbol=symbol,
             horizon=args.horizon,
             max_samples=max(args.max_samples, 1),
+        )
+
+    elif action == "cortex_resolve":
+        return cortex_resolve(
+            symbol=symbol,
+            horizon=args.horizon,
+            interval=args.interval,
         )
 
     elif action == "cortex_status":
