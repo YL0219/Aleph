@@ -7,7 +7,7 @@ using Xunit;
 namespace Aleph.Tests;
 
 /// <summary>
-/// Phase 9 Validation — C# proving harness for SleepCycleService.
+/// Phase 9/9.2 Validation — C# proving harness for SleepCycleService v2.
 ///
 /// Tests exercise the orchestration logic using hand-rolled stubs
 /// for IAether, IHomeostasis, IAlephBus, and IConfiguration.
@@ -19,6 +19,9 @@ namespace Aleph.Tests;
 ///   D. Training gate decisions
 ///   E. Summary event publishing with correct fields
 ///   F. Graceful error handling
+///   G. Stall detection (Phase 9.2)
+///   H. Periodic evaluation (Phase 9.2)
+///   I. Scorecard awareness (Phase 9.2)
 /// </summary>
 public class SleepCycleServiceTests
 {
@@ -287,6 +290,16 @@ public class SleepCycleServiceTests
         Assert.Equal(PulseSeverity.Elevated, evt.Severity);
     }
 
+    [Fact]
+    public async Task SummaryEvent_HasCycleNumber()
+    {
+        var env = new TestEnvironment();
+        await env.RunOneCycleAsync();
+
+        var evt = env.LastPublishedEvent!;
+        Assert.Equal(1, evt.CycleNumber);
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // ERROR HANDLING TESTS
     // ═══════════════════════════════════════════════════════════════
@@ -315,10 +328,137 @@ public class SleepCycleServiceTests
     }
 
     // ═══════════════════════════════════════════════════════════════
+    // STALL DETECTION TESTS (Phase 9.2)
+    // ═══════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task StallDetection_ZeroProgressIncrementsCounter()
+    {
+        // A cycle with no resolved and no training = zero progress
+        var env = new TestEnvironment();
+        env.Aether.StatusJson = BuildStatusJson(pending: 0, resolved: 0);
+        await env.RunOneCycleAsync();
+
+        var evt = env.LastPublishedEvent!;
+        Assert.True(evt.ConsecutiveZeroProgressCycles >= 1);
+    }
+
+    [Fact]
+    public async Task StallDetection_ProgressResetsCounter()
+    {
+        // Run a productive cycle
+        var env = new TestEnvironment();
+        env.Aether.StatusJson = BuildStatusJson(pending: 5, resolved: 5);
+        env.Aether.ResolveJson = BuildResolveJson(resolved: 3);
+        env.Aether.TrainJson = BuildTrainJson(fitted: 3);
+        await env.RunOneCycleAsync();
+
+        var evt = env.LastPublishedEvent!;
+        Assert.Equal(0, evt.ConsecutiveZeroProgressCycles);
+    }
+
+    [Fact]
+    public async Task StallDetection_SeverityWarning_WhenStalled()
+    {
+        // Run multiple zero-progress cycles to trigger stall
+        var env = new TestEnvironment();
+        env.Aether.StatusJson = BuildStatusJson(pending: 0, resolved: 0);
+        // Run 6 cycles (above default threshold of 5)
+        for (int i = 0; i < 6; i++)
+            await env.RunOneCycleAsync();
+
+        var evt = env.LastPublishedEvent!;
+        Assert.Equal(PulseSeverity.Warning, evt.Severity);
+        Assert.Contains("stalled", evt.Tags!);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // PERIODIC EVALUATION TESTS (Phase 9.2)
+    // ═══════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task Evaluation_RunsAtConfiguredInterval()
+    {
+        var env = new TestEnvironment(evaluateEveryCycles: 3);
+        env.Aether.StatusJson = BuildStatusJson(pending: 5, resolved: 5);
+        env.Aether.ResolveJson = BuildResolveJson(resolved: 2);
+        env.Aether.TrainJson = BuildTrainJson(fitted: 2);
+
+        // Cycles 1 and 2: no eval
+        await env.RunOneCycleAsync();
+        Assert.False(env.LastPublishedEvent!.EvaluationRan);
+        Assert.False(env.Aether.EvaluateCalled);
+
+        await env.RunOneCycleAsync();
+        Assert.False(env.LastPublishedEvent!.EvaluationRan);
+
+        // Cycle 3: eval runs
+        await env.RunOneCycleAsync();
+        Assert.True(env.LastPublishedEvent!.EvaluationRan);
+        Assert.True(env.Aether.EvaluateCalled);
+    }
+
+    [Fact]
+    public async Task Evaluation_NonFatalOnFailure()
+    {
+        var env = new TestEnvironment(evaluateEveryCycles: 1);
+        env.Aether.StatusJson = BuildStatusJson(pending: 5, resolved: 5);
+        env.Aether.ResolveJson = BuildResolveJson(resolved: 2);
+        env.Aether.TrainJson = BuildTrainJson(fitted: 2);
+        env.Aether.EvaluateSuccess = false;
+        await env.RunOneCycleAsync();
+
+        var evt = env.LastPublishedEvent!;
+        Assert.True(evt.EvaluationRan);
+        Assert.False(evt.EvaluationOk);
+        // But the rest of the cycle succeeded
+        Assert.True(evt.StatusOk);
+        Assert.True(evt.TrainOk);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // SCORECARD AWARENESS TESTS (Phase 9.2)
+    // ═══════════════════════════════════════════════════════════════
+
+    [Fact]
+    public async Task RollingScorecard_ParsedFromStatus()
+    {
+        var env = new TestEnvironment();
+        env.Aether.StatusJson = BuildStatusJsonWithScorecard(
+            pending: 5, resolved: 10,
+            rollingAccuracy: 0.65, rollingBrier: 0.28, rollingGrade: "B", rollingSamples: 50);
+        env.Aether.ResolveJson = BuildResolveJson(resolved: 2);
+        env.Aether.TrainJson = BuildTrainJson(fitted: 2);
+        await env.RunOneCycleAsync();
+
+        var evt = env.LastPublishedEvent!;
+        Assert.Equal(0.65, evt.RollingScorecardAccuracy);
+        Assert.Equal(0.28, evt.RollingScorecardBrier);
+        Assert.Equal("B", evt.RollingScorecardGrade);
+        Assert.Equal(50, evt.RollingScorecardSamples);
+    }
+
+    [Fact]
+    public async Task CycleScorecard_ParsedFromResolve()
+    {
+        var env = new TestEnvironment();
+        env.Aether.StatusJson = BuildStatusJson(pending: 5, resolved: 5);
+        env.Aether.ResolveJson = BuildResolveJsonWithScorecard(
+            resolved: 3, cycleAccuracy: 0.70, cycleBrier: 0.22, cycleGrade: "A");
+        env.Aether.TrainJson = BuildTrainJson(fitted: 3);
+        await env.RunOneCycleAsync();
+
+        var evt = env.LastPublishedEvent!;
+        Assert.Equal(0.70, evt.CycleScorecardAccuracy);
+        Assert.Equal(0.22, evt.CycleScorecardBrier);
+        Assert.Equal("A", evt.CycleScorecardGrade);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
     // JSON BUILDERS
     // ═══════════════════════════════════════════════════════════════
 
-    private static string BuildStatusJson(
+    internal static string BuildStatusJson(
         int pending = 0,
         int resolved = 0,
         int cursor = 0,
@@ -340,7 +480,34 @@ public class SleepCycleServiceTests
         return JsonSerializer.Serialize(obj);
     }
 
-    private static string BuildResolveJson(
+    private static string BuildStatusJsonWithScorecard(
+        int pending, int resolved,
+        double rollingAccuracy, double rollingBrier, string rollingGrade, int rollingSamples)
+    {
+        var obj = new
+        {
+            ok = true,
+            domain = "ml",
+            action = "cortex_status",
+            pending_count = pending,
+            pending_eligible_count = pending,
+            pending_blocked_count = 0,
+            resolved_count = resolved,
+            cursor_sequence = 0,
+            model_state = "warm",
+            trained_samples = rollingSamples,
+            rolling_scorecard = new
+            {
+                accuracy = rollingAccuracy,
+                brier_score = rollingBrier,
+                grade = rollingGrade,
+                sample_count = rollingSamples,
+            }
+        };
+        return JsonSerializer.Serialize(obj);
+    }
+
+    internal static string BuildResolveJson(
         int resolved = 0,
         int deferred = 0,
         int expired = 0,
@@ -367,7 +534,36 @@ public class SleepCycleServiceTests
         return JsonSerializer.Serialize(obj);
     }
 
-    private static string BuildTrainJson(
+    private static string BuildResolveJsonWithScorecard(
+        int resolved,
+        double cycleAccuracy, double cycleBrier, string cycleGrade)
+    {
+        var obj = new
+        {
+            ok = true,
+            domain = "ml",
+            action = "cortex_resolve",
+            resolution = new
+            {
+                resolved_count = resolved,
+                deferred_count = 0,
+                expired_count = 0,
+                errored_count = 0,
+                accuracy = cycleAccuracy,
+                mean_brier_score = cycleBrier,
+                class_distribution = new { bullish = 1, neutral = 1, bearish = 1 },
+            },
+            cycle_scorecard = new
+            {
+                accuracy = cycleAccuracy,
+                brier_score = cycleBrier,
+                grade = cycleGrade,
+            }
+        };
+        return JsonSerializer.Serialize(obj);
+    }
+
+    internal static string BuildTrainJson(
         int fitted = 0,
         int fresh = 0,
         int replay = 0,
@@ -407,6 +603,26 @@ public class SleepCycleServiceTests
         return JsonSerializer.Serialize(obj);
     }
 
+    private static string BuildEvaluateJson(
+        int challengersEvaluated = 3,
+        string bestChallenger = "tight_labels",
+        string decision = "INCONCLUSIVE")
+    {
+        var obj = new
+        {
+            ok = true,
+            domain = "ml",
+            action = "cortex_evaluate",
+            evaluation = new
+            {
+                challengers_evaluated = challengersEvaluated,
+                best_challenger = new { name = bestChallenger },
+                promotion_decision = new { decision },
+            }
+        };
+        return JsonSerializer.Serialize(obj);
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // TEST INFRASTRUCTURE — STUBS
     // ═══════════════════════════════════════════════════════════════
@@ -422,19 +638,19 @@ public class SleepCycleServiceTests
         public StubBus Bus { get; }
         public SleepCycleSummaryEvent? LastPublishedEvent => Bus.LastEvent as SleepCycleSummaryEvent;
 
+        private readonly SleepCycleService _svc;
+
         public TestEnvironment(
             double stressLevel = 0.1,
             double fatigueLevel = 0.1,
             bool overloaded = false,
-            bool breathless = false)
+            bool breathless = false,
+            int evaluateEveryCycles = 10)
         {
             Aether = new StubAether();
             Homeostasis = new StubHomeostasis(stressLevel, fatigueLevel, overloaded, breathless);
             Bus = new StubBus();
-        }
 
-        public async Task RunOneCycleAsync()
-        {
             var config = new ConfigurationBuilder()
                 .AddInMemoryCollection(new Dictionary<string, string?>
                 {
@@ -447,25 +663,21 @@ public class SleepCycleServiceTests
                     ["Aether:SleepCycle:Symbol"] = "BTCUSDT",
                     ["Aether:SleepCycle:Horizon"] = "1d",
                     ["Aether:SleepCycle:Interval"] = "1h",
+                    ["Aether:SleepCycle:EvaluateEveryCycles"] = evaluateEveryCycles.ToString(),
+                    ["Aether:SleepCycle:StallWarningThreshold"] = "5",
                 })
                 .Build();
 
             var logger = new NullLogger<SleepCycleService>();
 
-            var svc = new SleepCycleService(
+            _svc = new SleepCycleService(
                 Aether, Homeostasis, Bus, config, logger);
+        }
 
-            // Use reflection to call RunOneCycle directly, bypassing the
-            // BackgroundService loop and startup delay.
-            var method = typeof(SleepCycleService).GetMethod(
-                "RunOneCycle",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-
-            if (method == null)
-                throw new InvalidOperationException("Could not find RunOneCycle method via reflection.");
-
-            var task = (Task)method.Invoke(svc, new object[] { CancellationToken.None })!;
-            await task;
+        public async Task RunOneCycleAsync()
+        {
+            // RunOneCycle is now internal, callable directly
+            await _svc.RunOneCycle(CancellationToken.None);
         }
     }
 
@@ -490,6 +702,7 @@ public class SleepCycleServiceTests
         public bool StatusCalled => _ml.StatusCalled;
         public bool ResolveCalled => _ml.ResolveCalled;
         public bool TrainCalled => _ml.TrainCalled;
+        public bool EvaluateCalled => _ml.EvaluateCalled;
 
         // Control responses
         public string StatusJson
@@ -507,6 +720,11 @@ public class SleepCycleServiceTests
             get => _ml.TrainJson;
             set => _ml.TrainJson = value;
         }
+        public string EvaluateJson
+        {
+            get => _ml.EvaluateJson;
+            set => _ml.EvaluateJson = value;
+        }
         public bool StatusSuccess
         {
             get => _ml.StatusSuccess;
@@ -521,6 +739,11 @@ public class SleepCycleServiceTests
         {
             get => _ml.TrainSuccess;
             set => _ml.TrainSuccess = value;
+        }
+        public bool EvaluateSuccess
+        {
+            get => _ml.EvaluateSuccess;
+            set => _ml.EvaluateSuccess = value;
         }
         public bool StatusThrows
         {
@@ -537,14 +760,17 @@ public class SleepCycleServiceTests
             public bool StatusCalled;
             public bool ResolveCalled;
             public bool TrainCalled;
+            public bool EvaluateCalled;
 
             public string StatusJson = BuildStatusJson(pending: 5, resolved: 5);
             public string ResolveJson = BuildResolveJson(resolved: 2);
             public string TrainJson = BuildTrainJson(fitted: 2);
+            public string EvaluateJson = BuildEvaluateJson();
 
             public bool StatusSuccess = true;
             public bool ResolveSuccess = true;
             public bool TrainSuccess = true;
+            public bool EvaluateSuccess = true;
             public bool StatusThrows;
 
             public Task<AetherJsonResult> CortexStatusAsync(MlCortexStatusRequest request, CancellationToken ct)
@@ -566,9 +792,13 @@ public class SleepCycleServiceTests
                 return Task.FromResult(new AetherJsonResult(TrainSuccess, TrainJson, null, 0, false));
             }
 
+            public Task<AetherJsonResult> CortexEvaluateAsync(MlCortexEvaluateRequest request, CancellationToken ct)
+            {
+                EvaluateCalled = true;
+                return Task.FromResult(new AetherJsonResult(EvaluateSuccess, EvaluateJson, null, 0, false));
+            }
+
             public Task<AetherJsonResult> CortexPredictAsync(MlCortexPredictRequest request, CancellationToken ct) =>
-                throw new NotImplementedException();
-            public Task<AetherJsonResult> CortexEvaluateAsync(MlCortexEvaluateRequest request, CancellationToken ct) =>
                 throw new NotImplementedException();
             public Task<AetherJsonResult> PredictAsync(MlPredictRequest request, CancellationToken ct) =>
                 throw new NotImplementedException();
@@ -587,6 +817,9 @@ public class SleepCycleServiceTests
 
         private static string BuildTrainJson(int fitted) =>
             SleepCycleServiceTests.BuildTrainJson(fitted);
+
+        private static string BuildEvaluateJson() =>
+            SleepCycleServiceTests.BuildEvaluateJson();
     }
 
     // ─── Stub IHomeostasis ─────────────────────────────────────

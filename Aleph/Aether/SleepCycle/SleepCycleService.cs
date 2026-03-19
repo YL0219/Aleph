@@ -3,10 +3,16 @@ using System.Text.Json;
 namespace Aleph;
 
 /// <summary>
-/// The Sleep Cycle — background orchestrator for the offline learning loop.
+/// The Sleep Cycle v2 — background orchestrator for the offline learning loop.
 ///
 /// Periodically wakes, checks system health via Homeostasis, then drives
 /// the resolve → train pipeline through the existing Aether bridge.
+///
+/// v2 improvements over v1:
+///   - Stall detection: warns after consecutive zero-progress cycles
+///   - Periodic evaluation: runs challenger comparison every N cycles
+///   - Scorecard awareness: parses cycle/rolling scorecards from Python output
+///   - Structured logging with cycle numbering
 ///
 /// C# is PURE ORCHESTRATION here:
 ///   - no parquet inspection
@@ -24,7 +30,6 @@ public sealed class SleepCycleService : BackgroundService
     private readonly IAether _aether;
     private readonly IHomeostasis _homeostasis;
     private readonly IAlephBus _bus;
-    private readonly IConfiguration _configuration;
     private readonly ILogger<SleepCycleService> _logger;
     private readonly SemaphoreSlim _cycleLock = new(1, 1);
 
@@ -39,6 +44,13 @@ public sealed class SleepCycleService : BackgroundService
     private readonly string _activeSymbol;
     private readonly string _activeHorizon;
     private readonly string _activeInterval;
+    private readonly int _evaluateEveryCycles;
+    private readonly int _stallWarningThreshold;
+
+    // Runtime counters (only accessed from the single RunOneCycle path)
+    private int _cycleCount;
+    private int _consecutiveZeroProgressCycles;
+    private DateTimeOffset _lastProgressUtc = DateTimeOffset.UtcNow;
 
     public SleepCycleService(
         IAether aether,
@@ -50,7 +62,6 @@ public sealed class SleepCycleService : BackgroundService
         _aether = aether;
         _homeostasis = homeostasis;
         _bus = bus;
-        _configuration = configuration;
         _logger = logger;
 
         _cycleIntervalSeconds = ReadDouble(configuration, "Aether:SleepCycle:IntervalSeconds", 1800, 60, 86400);
@@ -63,13 +74,17 @@ public sealed class SleepCycleService : BackgroundService
         _activeSymbol = configuration["Aether:SleepCycle:Symbol"] ?? "BTCUSDT";
         _activeHorizon = configuration["Aether:SleepCycle:Horizon"] ?? "1d";
         _activeInterval = configuration["Aether:SleepCycle:Interval"] ?? "1h";
+        _evaluateEveryCycles = ReadInt(configuration, "Aether:SleepCycle:EvaluateEveryCycles", 10, 1, 100);
+        _stallWarningThreshold = ReadInt(configuration, "Aether:SleepCycle:StallWarningThreshold", 5, 2, 50);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation(
-            "[SleepCycle] Starting. Symbol={Symbol}, Horizon={Horizon}, Interval={Interval}s",
-            _activeSymbol, _activeHorizon, _cycleIntervalSeconds);
+            "[SleepCycle] Starting. Symbol={Symbol}, Horizon={Horizon}, Interval={Interval}, " +
+            "CycleInterval={CycleSec}s, EvalEvery={EvalEvery} cycles, StallThreshold={StallThreshold}",
+            _activeSymbol, _activeHorizon, _activeInterval,
+            _cycleIntervalSeconds, _evaluateEveryCycles, _stallWarningThreshold);
 
         // Wait for system warmup
         try { await Task.Delay(TimeSpan.FromSeconds(_startupDelaySeconds), stoppingToken); }
@@ -86,7 +101,7 @@ public sealed class SleepCycleService : BackgroundService
             catch (OperationCanceledException) { break; }
         }
 
-        _logger.LogInformation("[SleepCycle] Stopped.");
+        _logger.LogInformation("[SleepCycle] Stopped after {CycleCount} cycles.", _cycleCount);
     }
 
     /// <summary>
@@ -114,15 +129,19 @@ public sealed class SleepCycleService : BackgroundService
     /// <summary>
     /// The main orchestration sequence:
     ///   1. Check homeostasis
-    ///   2. Status
-    ///   3. Resolve
+    ///   2. Status (with rolling scorecard)
+    ///   3. Resolve (with cycle scorecard)
     ///   4. Train (if gated)
-    ///   5. Publish summary
+    ///   5. Evaluate (periodically)
+    ///   6. Stall detection
+    ///   7. Publish summary
     /// </summary>
-    private async Task RunOneCycle(CancellationToken ct)
+    internal async Task RunOneCycle(CancellationToken ct)
     {
+        _cycleCount++;
+        var cycleNum = _cycleCount;
         var cycleStart = DateTimeOffset.UtcNow;
-        var summary = new CycleSummary();
+        var summary = new CycleSummary { CycleNumber = cycleNum };
 
         try
         {
@@ -135,8 +154,8 @@ public sealed class SleepCycleService : BackgroundService
             summary.IsBreathless = _homeostasis.IsBreathless;
 
             _logger.LogDebug(
-                "[SleepCycle] Woke. Stress={Stress:F2}, Fatigue={Fatigue:F2}, Overloaded={OL}, Breathless={BL}",
-                snapshot.StressLevel, snapshot.FatigueLevel, summary.IsOverloaded, summary.IsBreathless);
+                "[SleepCycle] #{Cycle} Woke. Stress={Stress:F2}, Fatigue={Fatigue:F2}, Overloaded={OL}, Breathless={BL}",
+                cycleNum, snapshot.StressLevel, snapshot.FatigueLevel, summary.IsOverloaded, summary.IsBreathless);
 
             // ── Step 2: Status ──
             var statusResult = await CallStatusAsync(ct);
@@ -146,14 +165,14 @@ public sealed class SleepCycleService : BackgroundService
 
             if (!summary.StatusOk)
             {
-                _logger.LogWarning("[SleepCycle] Status call failed. Skipping resolve/train.");
+                _logger.LogWarning("[SleepCycle] #{Cycle} Status call failed. Skipping resolve/train.", cycleNum);
                 summary.SkipReason = "status_failed";
                 goto PublishSummary;
             }
 
             _logger.LogDebug(
-                "[SleepCycle] Status: pending={Pending}, resolved={Resolved}, cursor={Cursor}",
-                summary.PendingCount, summary.ResolvedCount, summary.CursorSequence);
+                "[SleepCycle] #{Cycle} Status: pending={Pending}, resolved={Resolved}, cursor={Cursor}, model={Model}",
+                cycleNum, summary.PendingCount, summary.ResolvedCount, summary.CursorSequence, summary.ModelState ?? "unknown");
 
             // ── Step 3: Resolve ──
             var shouldResolve = summary.PendingCount >= _minPendingToResolve;
@@ -165,14 +184,21 @@ public sealed class SleepCycleService : BackgroundService
                     ParseResolveInto(resolveResult.PayloadJson, summary);
 
                 _logger.LogInformation(
-                    "[SleepCycle] Resolve: resolved={Resolved}, deferred={Deferred}, expired={Expired}, errored={Errored}",
-                    summary.NewlyResolved, summary.Deferred, summary.Expired, summary.Errored);
+                    "[SleepCycle] #{Cycle} Resolve: resolved={Resolved}, deferred={Deferred}, expired={Expired}, errored={Errored}",
+                    cycleNum, summary.NewlyResolved, summary.Deferred, summary.Expired, summary.Errored);
+
+                if (summary.CycleScorecardBrier > 0)
+                {
+                    _logger.LogInformation(
+                        "[SleepCycle] #{Cycle} Cycle scorecard: accuracy={Acc:F3}, brier={Brier:F3}, grade={Grade}",
+                        cycleNum, summary.CycleScorecardAccuracy, summary.CycleScorecardBrier, summary.CycleScorecardGrade ?? "n/a");
+                }
             }
             else
             {
                 summary.ResolveOk = true; // no-op is ok
-                _logger.LogDebug("[SleepCycle] Skipping resolve — {Pending} pending < {Min} minimum.",
-                    summary.PendingCount, _minPendingToResolve);
+                _logger.LogDebug("[SleepCycle] #{Cycle} Skipping resolve — {Pending} pending < {Min} minimum.",
+                    cycleNum, summary.PendingCount, _minPendingToResolve);
             }
 
             // ── Step 4: Training gate ──
@@ -187,14 +213,67 @@ public sealed class SleepCycleService : BackgroundService
                 if (trainResult.Success)
                     ParseTrainInto(trainResult.PayloadJson, summary);
 
+                // Class skew detection (moved here from static parser)
+                DetectClassSkew(summary);
+
                 _logger.LogInformation(
-                    "[SleepCycle] Train: fitted={Fitted}, fresh={Fresh}, replay={Replay}, drifts={Drifts}",
-                    summary.SamplesFitted, summary.FreshCount, summary.ReplayCount,
+                    "[SleepCycle] #{Cycle} Train: fitted={Fitted}, fresh={Fresh}, replay={Replay}, drifts={Drifts}",
+                    cycleNum, summary.SamplesFitted, summary.FreshCount, summary.ReplayCount,
                     summary.DriftFlags?.Count ?? 0);
             }
             else
             {
-                _logger.LogDebug("[SleepCycle] Training skipped: {Reason}", trainingDecision.Reason);
+                _logger.LogDebug("[SleepCycle] #{Cycle} Training skipped: {Reason}", cycleNum, trainingDecision.Reason);
+            }
+
+            // ── Step 5: Periodic evaluation ──
+            if (cycleNum > 0 && cycleNum % _evaluateEveryCycles == 0)
+            {
+                _logger.LogInformation("[SleepCycle] #{Cycle} Running periodic challenger evaluation.", cycleNum);
+                try
+                {
+                    var evalResult = await CallEvaluateAsync(ct);
+                    summary.EvaluationRan = true;
+                    summary.EvaluationOk = evalResult.Success;
+                    if (evalResult.Success)
+                        ParseEvaluateInto(evalResult.PayloadJson, summary);
+
+                    _logger.LogInformation(
+                        "[SleepCycle] #{Cycle} Evaluation complete: challengers={Count}, bestChallenger={Best}, decision={Decision}",
+                        cycleNum, summary.EvaluationChallengerCount, summary.EvaluationBestChallenger ?? "none",
+                        summary.EvaluationPromotionDecision ?? "n/a");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "[SleepCycle] #{Cycle} Evaluation failed (non-fatal).", cycleNum);
+                    summary.EvaluationRan = true;
+                    summary.EvaluationOk = false;
+                }
+            }
+
+            // ── Step 6: Stall detection ──
+            var madeProgress = summary.NewlyResolved > 0 || summary.SamplesFitted > 0;
+            if (madeProgress)
+            {
+                _consecutiveZeroProgressCycles = 0;
+                _lastProgressUtc = DateTimeOffset.UtcNow;
+            }
+            else
+            {
+                _consecutiveZeroProgressCycles++;
+            }
+
+            summary.ConsecutiveZeroProgressCycles = _consecutiveZeroProgressCycles;
+            summary.HoursSinceLastProgress = (DateTimeOffset.UtcNow - _lastProgressUtc).TotalHours;
+
+            if (_consecutiveZeroProgressCycles >= _stallWarningThreshold)
+            {
+                var hoursSince = summary.HoursSinceLastProgress;
+                _logger.LogWarning(
+                    "[SleepCycle] #{Cycle} STALL DETECTED: {StallCount} consecutive zero-progress cycles " +
+                    "({Hours:F1}h since last progress). Pending={Pending}, Resolved={Resolved}.",
+                    cycleNum, _consecutiveZeroProgressCycles, hoursSince,
+                    summary.PendingCount, summary.ResolvedCount);
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -203,7 +282,7 @@ public sealed class SleepCycleService : BackgroundService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "[SleepCycle] Unhandled error in cycle.");
+            _logger.LogError(ex, "[SleepCycle] #{Cycle} Unhandled error in cycle.", _cycleCount);
             summary.SkipReason = $"error:{ex.Message}";
         }
 
@@ -212,8 +291,10 @@ public sealed class SleepCycleService : BackgroundService
         await PublishSummaryEvent(summary, ct);
 
         _logger.LogInformation(
-            "[SleepCycle] Cycle complete in {Duration}ms. Resolved={Resolved}, Trained={Trained}, Gate={Gate}",
-            summary.DurationMs, summary.NewlyResolved, summary.SamplesFitted, summary.TrainingGateResult);
+            "[SleepCycle] #{Cycle} Complete in {Duration}ms. Resolved={Resolved}, Trained={Trained}, " +
+            "Gate={Gate}, Stall={StallCount}",
+            summary.CycleNumber, summary.DurationMs, summary.NewlyResolved, summary.SamplesFitted,
+            summary.TrainingGateResult, summary.ConsecutiveZeroProgressCycles);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -243,6 +324,13 @@ public sealed class SleepCycleService : BackgroundService
             MaxSamples = 200,
         }, ct);
 
+    private Task<AetherJsonResult> CallEvaluateAsync(CancellationToken ct) =>
+        _aether.Ml.CortexEvaluateAsync(new MlCortexEvaluateRequest
+        {
+            Symbol = _activeSymbol,
+            ActiveHorizon = _activeHorizon,
+        }, ct);
+
     // ═══════════════════════════════════════════════════════════════
     // TRAINING GATE
     // ═══════════════════════════════════════════════════════════════
@@ -266,9 +354,6 @@ public sealed class SleepCycleService : BackgroundService
             return TrainingDecision.Blocked("resolve_failed");
 
         // Check if enough resolved data exists
-        // After a resolve cycle, we need to re-fetch status to see updated counts.
-        // But to avoid an extra Python call, we use the resolve summary:
-        // if we just resolved new samples, training is likely worthwhile.
         if (summary.NewlyResolved > 0)
             return TrainingDecision.Allow("new_resolved_available");
 
@@ -277,6 +362,25 @@ public sealed class SleepCycleService : BackgroundService
             return TrainingDecision.Allow("existing_resolved_backlog");
 
         return TrainingDecision.Blocked($"insufficient_resolved:{summary.ResolvedCount}<{_minResolvedToTrain}");
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // CLASS SKEW DETECTION
+    // ═══════════════════════════════════════════════════════════════
+
+    private void DetectClassSkew(CycleSummary summary)
+    {
+        if (summary.TrainClassDistribution is not { Count: > 0 })
+            return;
+
+        var total = summary.TrainClassDistribution.Values.Sum();
+        var max = summary.TrainClassDistribution.Values.Max();
+
+        if (total > 0 && (double)max / total > 0.7)
+        {
+            var dominant = summary.TrainClassDistribution.First(kv => kv.Value == max).Key;
+            summary.ClassSkewWarning = $"dominant_class:{dominant}({max}/{total}={100.0 * max / total:F0}%)";
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -297,6 +401,15 @@ public sealed class SleepCycleService : BackgroundService
             s.CursorSequence = SafeInt(r, "cursor_sequence");
             s.ModelState = SafeStr(r, "model_state");
             s.TrainedSamples = SafeInt(r, "trained_samples");
+
+            // Rolling scorecard from status (Phase 9.1)
+            if (r.TryGetProperty("rolling_scorecard", out var rs) && rs.ValueKind == JsonValueKind.Object)
+            {
+                s.RollingScorecardAccuracy = SafeDbl(rs, "accuracy");
+                s.RollingScorecardBrier = SafeDbl(rs, "brier_score");
+                s.RollingScorecardGrade = SafeStr(rs, "grade");
+                s.RollingScorecardSamples = SafeInt(rs, "sample_count");
+            }
         }
         catch { /* non-fatal */ }
     }
@@ -328,6 +441,14 @@ public sealed class SleepCycleService : BackgroundService
                     s.ResolvedClassDistribution = dist;
                 }
             }
+
+            // Cycle scorecard from resolve (Phase 9.1)
+            if (r.TryGetProperty("cycle_scorecard", out var cs) && cs.ValueKind == JsonValueKind.Object)
+            {
+                s.CycleScorecardAccuracy = SafeDbl(cs, "accuracy");
+                s.CycleScorecardBrier = SafeDbl(cs, "brier_score");
+                s.CycleScorecardGrade = SafeStr(cs, "grade");
+            }
         }
         catch { /* non-fatal */ }
     }
@@ -355,19 +476,6 @@ public sealed class SleepCycleService : BackgroundService
                             dist[prop.Name] = cnt;
                     }
                     s.TrainClassDistribution = dist;
-
-                    // Class skew detection
-                    if (dist.Count > 0)
-                    {
-                        var total = dist.Values.Sum();
-                        var max = dist.Values.Max();
-                        if (total > 0 && (double)max / total > 0.7)
-                        {
-                            var dominant = dist.First(kv => kv.Value == max).Key;
-                            s.ClassSkewWarning = $"dominant_class:{dominant}({max}/{total}={100.0 * max / total:F0}%)";
-                            _logger_static_warning = s.ClassSkewWarning; // can't use logger here, set on summary
-                        }
-                    }
                 }
 
                 if (tr.TryGetProperty("drift_flags", out var df) && df.ValueKind == JsonValueKind.Array)
@@ -387,8 +495,27 @@ public sealed class SleepCycleService : BackgroundService
         catch { /* non-fatal */ }
     }
 
-    // Workaround: class skew detection happens in static parse, so we log in cycle
-    [ThreadStatic] private static string? _logger_static_warning;
+    private static void ParseEvaluateInto(string json, CycleSummary s)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return;
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var r = doc.RootElement;
+
+            if (r.TryGetProperty("evaluation", out var eval))
+            {
+                s.EvaluationChallengerCount = SafeInt(eval, "challengers_evaluated");
+
+                if (eval.TryGetProperty("best_challenger", out var bc) && bc.ValueKind == JsonValueKind.Object)
+                    s.EvaluationBestChallenger = SafeStr(bc, "name");
+
+                if (eval.TryGetProperty("promotion_decision", out var pd) && pd.ValueKind == JsonValueKind.Object)
+                    s.EvaluationPromotionDecision = SafeStr(pd, "decision");
+            }
+        }
+        catch { /* non-fatal */ }
+    }
 
     // ═══════════════════════════════════════════════════════════════
     // SUMMARY EVENT PUBLISHING
@@ -396,12 +523,11 @@ public sealed class SleepCycleService : BackgroundService
 
     private async Task PublishSummaryEvent(CycleSummary s, CancellationToken ct)
     {
-        // Log class skew if detected
         if (!string.IsNullOrEmpty(s.ClassSkewWarning))
-            _logger.LogWarning("[SleepCycle] Class skew detected: {Skew}", s.ClassSkewWarning);
+            _logger.LogWarning("[SleepCycle] #{Cycle} Class skew detected: {Skew}", s.CycleNumber, s.ClassSkewWarning);
 
         if (s.DriftFlags is { Count: > 0 })
-            _logger.LogWarning("[SleepCycle] Drift flags: {Flags}", string.Join(", ", s.DriftFlags));
+            _logger.LogWarning("[SleepCycle] #{Cycle} Drift flags: {Flags}", s.CycleNumber, string.Join(", ", s.DriftFlags));
 
         var evt = new SleepCycleSummaryEvent
         {
@@ -414,6 +540,7 @@ public sealed class SleepCycleService : BackgroundService
             Symbol = _activeSymbol,
             Horizon = _activeHorizon,
             DurationMs = s.DurationMs,
+            CycleNumber = s.CycleNumber,
 
             StatusOk = s.StatusOk,
             ResolveOk = s.ResolveOk,
@@ -446,6 +573,26 @@ public sealed class SleepCycleService : BackgroundService
 
             StressLevel = s.StressLevel,
             FatigueLevel = s.FatigueLevel,
+
+            // Scorecard fields
+            CycleScorecardAccuracy = s.CycleScorecardAccuracy,
+            CycleScorecardBrier = s.CycleScorecardBrier,
+            CycleScorecardGrade = s.CycleScorecardGrade,
+            RollingScorecardAccuracy = s.RollingScorecardAccuracy,
+            RollingScorecardBrier = s.RollingScorecardBrier,
+            RollingScorecardGrade = s.RollingScorecardGrade,
+            RollingScorecardSamples = s.RollingScorecardSamples,
+
+            // Stall detection
+            ConsecutiveZeroProgressCycles = s.ConsecutiveZeroProgressCycles,
+            HoursSinceLastProgress = s.HoursSinceLastProgress,
+
+            // Evaluation
+            EvaluationRan = s.EvaluationRan,
+            EvaluationOk = s.EvaluationOk,
+            EvaluationChallengerCount = s.EvaluationChallengerCount,
+            EvaluationBestChallenger = s.EvaluationBestChallenger,
+            EvaluationPromotionDecision = s.EvaluationPromotionDecision,
         };
 
         try { await _bus.PublishAsync(evt, ct); }
@@ -454,6 +601,9 @@ public sealed class SleepCycleService : BackgroundService
 
     private static PulseSeverity DetermineSeverity(CycleSummary s)
     {
+        // Stall is a warning-level signal
+        if (s.ConsecutiveZeroProgressCycles >= 5)
+            return PulseSeverity.Warning;
         if (!string.IsNullOrEmpty(s.SkipReason) && s.SkipReason.StartsWith("error"))
             return PulseSeverity.Warning;
         if (s.DriftFlags is { Count: > 0 })
@@ -469,6 +619,8 @@ public sealed class SleepCycleService : BackgroundService
         if (s.NewlyResolved > 0) tags.Add("resolved");
         if (s.SamplesFitted > 0) tags.Add("trained");
         if (!string.IsNullOrEmpty(s.SkipReason)) tags.Add("skipped");
+        if (s.EvaluationRan) tags.Add("evaluated");
+        if (s.ConsecutiveZeroProgressCycles >= 5) tags.Add("stalled");
         return tags.ToArray();
     }
 
@@ -511,6 +663,8 @@ public sealed class SleepCycleService : BackgroundService
 
     private sealed class CycleSummary
     {
+        public int CycleNumber;
+
         // Homeostasis
         public double StressLevel;
         public double FatigueLevel;
@@ -528,6 +682,12 @@ public sealed class SleepCycleService : BackgroundService
         public string? ModelState;
         public int TrainedSamples;
 
+        // Rolling scorecard (from status)
+        public double RollingScorecardAccuracy;
+        public double RollingScorecardBrier;
+        public string? RollingScorecardGrade;
+        public int RollingScorecardSamples;
+
         // Resolve
         public bool ResolveOk;
         public int NewlyResolved;
@@ -537,6 +697,11 @@ public sealed class SleepCycleService : BackgroundService
         public double ResolveAccuracy;
         public double ResolveMeanBrier;
         public Dictionary<string, int>? ResolvedClassDistribution;
+
+        // Cycle scorecard (from resolve)
+        public double CycleScorecardAccuracy;
+        public double CycleScorecardBrier;
+        public string? CycleScorecardGrade;
 
         // Train
         public bool TrainOk;
@@ -550,6 +715,17 @@ public sealed class SleepCycleService : BackgroundService
         public string? ClassSkewWarning;
         public List<string>? DriftFlags;
         public int CursorSequenceAfterTrain;
+
+        // Stall detection
+        public int ConsecutiveZeroProgressCycles;
+        public double HoursSinceLastProgress;
+
+        // Evaluation
+        public bool EvaluationRan;
+        public bool EvaluationOk;
+        public int EvaluationChallengerCount;
+        public string? EvaluationBestChallenger;
+        public string? EvaluationPromotionDecision;
 
         // Meta
         public long DurationMs;

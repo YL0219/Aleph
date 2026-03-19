@@ -71,6 +71,7 @@ public sealed record MarketDataEvent : AlephEvent
 /// <summary>
 /// Blood cell summarizing one completed Sleep Cycle (resolve → train).
 /// Published by SleepCycleService at the end of each cycle for observability.
+/// v2: adds cycle numbering, scorecard fields, stall detection, evaluation results.
 /// </summary>
 public sealed record SleepCycleSummaryEvent : AlephEvent
 {
@@ -78,6 +79,7 @@ public sealed record SleepCycleSummaryEvent : AlephEvent
     public required string Symbol { get; init; }
     public required string Horizon { get; init; }
     public required long DurationMs { get; init; }
+    public int CycleNumber { get; init; }
 
     // Phase results
     public bool StatusOk { get; init; }
@@ -117,4 +119,26 @@ public sealed record SleepCycleSummaryEvent : AlephEvent
     // Homeostasis at cycle time
     public double StressLevel { get; init; }
     public double FatigueLevel { get; init; }
+
+    // Cycle scorecard (from resolve — this batch's quality)
+    public double CycleScorecardAccuracy { get; init; }
+    public double CycleScorecardBrier { get; init; }
+    public string? CycleScorecardGrade { get; init; }
+
+    // Rolling scorecard (from status — overall model quality)
+    public double RollingScorecardAccuracy { get; init; }
+    public double RollingScorecardBrier { get; init; }
+    public string? RollingScorecardGrade { get; init; }
+    public int RollingScorecardSamples { get; init; }
+
+    // Stall detection
+    public int ConsecutiveZeroProgressCycles { get; init; }
+    public double HoursSinceLastProgress { get; init; }
+
+    // Periodic evaluation results
+    public bool EvaluationRan { get; init; }
+    public bool EvaluationOk { get; init; }
+    public int EvaluationChallengerCount { get; init; }
+    public string? EvaluationBestChallenger { get; init; }
+    public string? EvaluationPromotionDecision { get; init; }
 }
