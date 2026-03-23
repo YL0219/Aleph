@@ -100,6 +100,18 @@ public class MarketIngestionOrchestrator : IMarketIngestionCycle
                 await PublishIngestionEventsAsync(runResult, ct);
             }
 
+            // ── Perception refresh: macro proxies, calendar, headlines ──
+            _logger.LogInformation("[Ingestion] Running perception refresh...");
+            try
+            {
+                await RunPerceptionRefreshAsync(ct);
+            }
+            catch (Exception percEx) when (percEx is not OperationCanceledException)
+            {
+                // Perception failure must NOT crash the ingestion cycle
+                _logger.LogWarning(percEx, "[Ingestion] Perception refresh failed (non-fatal).");
+            }
+
             _logger.LogInformation("[Ingestion] Cycle complete. Running reflexive stress evaluation...");
 
             // Reflexive stress detection — runs after fresh data is available
@@ -121,6 +133,49 @@ public class MarketIngestionOrchestrator : IMarketIngestionCycle
         {
             _logger.LogError(ex, "[Ingestion] Cycle failed.");
             throw; // Let HeartbeatService catch and track in Homeostasis
+        }
+    }
+
+    /// <summary>
+    /// Run perception ingest and publish a PerceptionRefreshEvent.
+    /// </summary>
+    private async Task RunPerceptionRefreshAsync(CancellationToken ct)
+    {
+        var result = await _axiom.Perception.RunIngestAsync(ct: ct);
+
+        var evt = new PerceptionRefreshEvent
+        {
+            OccurredAtUtc = DateTimeOffset.UtcNow,
+            Source = "Ingestion",
+            Kind = "perception_refresh",
+            Severity = result.Success ? PulseSeverity.Normal : PulseSeverity.Warning,
+            Success = result.Success,
+            DurationMs = result.DurationMs,
+            ProxiesSucceeded = result.ProxiesSucceeded,
+            ProxiesTotal = result.ProxiesTotal,
+            CalendarOk = result.CalendarOk,
+            CalendarProvider = result.CalendarProvider,
+            CalendarEventCount = result.CalendarEventCount,
+            HeadlinesOk = result.HeadlinesOk,
+            HeadlinesProvider = result.HeadlinesProvider,
+            HeadlineCount = result.HeadlineCount,
+            ManifestPath = result.ManifestPath,
+            ErrorMessage = result.ErrorMessage,
+        };
+
+        await _bus.PublishAsync(evt, ct);
+
+        if (result.Success)
+        {
+            _logger.LogInformation(
+                "[Ingestion] Perception refresh complete: proxies={Proxies}/{Total}, calendar={Cal}, headlines={Head}",
+                result.ProxiesSucceeded, result.ProxiesTotal,
+                result.CalendarOk ? result.CalendarEventCount.ToString() + " events" : "failed",
+                result.HeadlinesOk ? result.HeadlineCount.ToString() + " items" : "failed");
+        }
+        else
+        {
+            _logger.LogWarning("[Ingestion] Perception refresh reported failure: {Error}", result.ErrorMessage);
         }
     }
 

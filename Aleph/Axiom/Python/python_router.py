@@ -21,6 +21,10 @@ News domain actions:
     headlines       Fetch recent headlines (OpenBB -> yfinance -> RSS fallback)
     scrape          Scrape website text with SSRF protections
 
+Perception domain actions:
+    ingest          Fetch macro proxies, economic calendar, and headlines
+    snapshot        Read local perception artifacts (no network calls)
+
 Legacy domain actions:
     fetch-news      RSI + news sentiment report (stdout is human-readable text, NOT JSON)
 
@@ -31,6 +35,8 @@ Examples:
     python python_router.py market parquet-read --symbol AMD --days 7
     python python_router.py news headlines --symbol AMD --limit 5
     python python_router.py news scrape --url https://example.com --timeoutSec 12
+    python python_router.py perception ingest --lookbackDays 365 --headlineLimit 15
+    python python_router.py perception snapshot --headlineLimit 10
     python python_router.py legacy fetch-news AMD
 """
 
@@ -90,6 +96,18 @@ def _route_news(action, remaining):
         _error_exit(f"Unknown news action: '{action}'. Valid: headlines, scrape")
 
 
+def _route_perception(action, remaining):
+    """Dispatch perception domain actions to worker modules."""
+    if action == "ingest":
+        from Workers.perception_ingest import main as worker_main
+        worker_main(remaining)
+    elif action == "snapshot":
+        from Workers.perception_snapshot import main as worker_main
+        worker_main(remaining)
+    else:
+        _error_exit(f"Unknown perception action: '{action}'. Valid: ingest, snapshot")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Deep Blue Python Router — thin dispatcher to worker modules")
@@ -108,10 +126,12 @@ def main():
         _route_market(args.action, remaining)
     elif args.domain == "news":
         _route_news(args.action, remaining)
+    elif args.domain == "perception":
+        _route_perception(args.action, remaining)
     elif args.domain == "legacy":
         _route_legacy(args.action, remaining)
     else:
-        _error_exit(f"Unknown domain: '{args.domain}'. Valid: market, news, legacy")
+        _error_exit(f"Unknown domain: '{args.domain}'. Valid: market, news, perception, legacy")
 
 
 if __name__ == "__main__":

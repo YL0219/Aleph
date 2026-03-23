@@ -13,6 +13,7 @@ public interface IAxiom
     IAxiom.IChatGateway Chat { get; }
     IAxiom.IToolRunGateway ToolRuns { get; }
     IAxiom.ISkillGateway Skills { get; }
+    IAxiom.IPerceptionGateway Perception { get; }
 
     public interface IPythonRouter
     {
@@ -116,7 +117,41 @@ public interface IAxiom
 
         string ReadPlaybook(string skillName);
     }
+
+    public interface IPerceptionGateway
+    {
+        /// <summary>
+        /// Run perception ingest — fetches macro proxies, economic calendar, headlines.
+        /// Returns parsed report JSON. Non-fatal: individual sections may fail.
+        /// </summary>
+        Task<PerceptionIngestResult> RunIngestAsync(
+            int lookbackDays = 365,
+            int headlineLimit = 15,
+            int calendarHorizonDays = 30,
+            CancellationToken ct = default);
+
+        /// <summary>
+        /// Read the local perception snapshot (no network calls).
+        /// </summary>
+        Task<PythonRouteResult> ReadSnapshotAsync(
+            int headlineLimit = 10,
+            CancellationToken ct = default);
+    }
 }
+
+public sealed record PerceptionIngestResult(
+    bool Success,
+    int ProxiesSucceeded,
+    int ProxiesTotal,
+    bool CalendarOk,
+    string? CalendarProvider,
+    int CalendarEventCount,
+    bool HeadlinesOk,
+    string? HeadlinesProvider,
+    int HeadlineCount,
+    string? ManifestPath,
+    long DurationMs,
+    string? ErrorMessage);
 
 public sealed record PythonRouteResult(
     bool Success,

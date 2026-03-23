@@ -31,6 +31,7 @@ public sealed class Axiom : IAxiom
     public IAxiom.IChatGateway Chat { get; }
     public IAxiom.IToolRunGateway ToolRuns { get; }
     public IAxiom.ISkillGateway Skills { get; }
+    public IAxiom.IPerceptionGateway Perception { get; }
 
     public Axiom(
         IDbContextFactory<AppDbContext> dbFactory,
@@ -63,6 +64,7 @@ public sealed class Axiom : IAxiom
         Chat = new ChatGateway(this);
         ToolRuns = new ToolRunGateway(this);
         Skills = new SkillGateway(this);
+        Perception = new PerceptionGateway(this);
     }
 
     private sealed class PythonRouterGateway : IAxiom.IPythonRouter
@@ -1153,6 +1155,94 @@ public sealed class Axiom : IAxiom
             };
 
             return JsonSerializer.Serialize(response, JsonOpts);
+        }
+    }
+
+    private sealed class PerceptionGateway : IAxiom.IPerceptionGateway
+    {
+        private const int IngestTimeoutMs = 120_000; // 2 min — fetches 7 proxies + calendar + headlines
+        private const int SnapshotTimeoutMs = 15_000; // local reads only
+
+        private readonly Axiom _root;
+
+        public PerceptionGateway(Axiom root) => _root = root;
+
+        public async Task<PerceptionIngestResult> RunIngestAsync(
+            int lookbackDays = 365,
+            int headlineLimit = 15,
+            int calendarHorizonDays = 30,
+            CancellationToken ct = default)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            if (!_root._pythonDispatcher.IsAvailable)
+            {
+                return new PerceptionIngestResult(
+                    false, 0, 0, false, null, 0, false, null, 0, null, 0,
+                    "Python not available");
+            }
+
+            var result = await _root._pythonDispatcher.RunPerceptionIngestAsync(
+                lookbackDays, headlineLimit, calendarHorizonDays, IngestTimeoutMs, ct);
+
+            sw.Stop();
+
+            if (!result.Success || result.TimedOut)
+            {
+                return new PerceptionIngestResult(
+                    false, 0, 0, false, null, 0, false, null, 0, null, sw.ElapsedMilliseconds,
+                    result.TimedOut ? "Perception ingest timed out" : result.Stderr);
+            }
+
+            try
+            {
+                using var doc = JsonDocument.Parse(result.Stdout);
+                var root = doc.RootElement;
+
+                var proxies = root.GetProperty("proxies");
+                var calendar = root.GetProperty("calendar");
+                var headlines = root.GetProperty("headlines");
+
+                return new PerceptionIngestResult(
+                    Success: root.GetProperty("ok").GetBoolean(),
+                    ProxiesSucceeded: proxies.GetProperty("succeeded").GetInt32(),
+                    ProxiesTotal: proxies.GetProperty("total").GetInt32(),
+                    CalendarOk: calendar.GetProperty("ok").GetBoolean(),
+                    CalendarProvider: calendar.TryGetProperty("provider", out var cp) ? cp.GetString() : null,
+                    CalendarEventCount: calendar.GetProperty("eventCount").GetInt32(),
+                    HeadlinesOk: headlines.GetProperty("ok").GetBoolean(),
+                    HeadlinesProvider: headlines.TryGetProperty("provider", out var hp) ? hp.GetString() : null,
+                    HeadlineCount: headlines.GetProperty("headlineCount").GetInt32(),
+                    ManifestPath: root.TryGetProperty("manifestPath", out var mp) ? mp.GetString() : null,
+                    DurationMs: sw.ElapsedMilliseconds,
+                    ErrorMessage: null);
+            }
+            catch (Exception ex)
+            {
+                return new PerceptionIngestResult(
+                    false, 0, 0, false, null, 0, false, null, 0, null, sw.ElapsedMilliseconds,
+                    $"Failed to parse ingest report: {ex.Message}");
+            }
+        }
+
+        public async Task<PythonRouteResult> ReadSnapshotAsync(
+            int headlineLimit = 10,
+            CancellationToken ct = default)
+        {
+            if (!_root._pythonDispatcher.IsAvailable)
+            {
+                return new PythonRouteResult(false, "", "Python not available", -1, false);
+            }
+
+            var result = await _root._pythonDispatcher.RunPerceptionSnapshotAsync(
+                headlineLimit, SnapshotTimeoutMs, ct);
+
+            return new PythonRouteResult(
+                result.Success && !result.TimedOut,
+                result.Stdout,
+                result.Stderr,
+                result.ExitCode,
+                result.TimedOut);
         }
     }
 

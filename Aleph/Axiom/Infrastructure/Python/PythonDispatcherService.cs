@@ -119,6 +119,44 @@ namespace Aleph
         }
 
         /// <summary>
+        /// Convenience: run perception ingest (macro proxies, calendar, headlines).
+        /// Returns the raw ProcessResult — caller parses JSON from Stdout.
+        /// </summary>
+        public Task<ProcessResult> RunPerceptionIngestAsync(
+            int lookbackDays,
+            int headlineLimit,
+            int calendarHorizonDays,
+            int timeoutMs,
+            CancellationToken ct = default)
+        {
+            var extraArgs = new List<string>
+            {
+                "--lookbackDays", lookbackDays.ToString(),
+                "--headlineLimit", headlineLimit.ToString(),
+                "--calendarHorizonDays", calendarHorizonDays.ToString()
+            };
+
+            return RunAsync("perception", "ingest", extraArgs, timeoutMs, ct);
+        }
+
+        /// <summary>
+        /// Convenience: read local perception snapshot (no network calls).
+        /// Returns the raw ProcessResult — caller parses JSON from Stdout.
+        /// </summary>
+        public Task<ProcessResult> RunPerceptionSnapshotAsync(
+            int headlineLimit,
+            int timeoutMs,
+            CancellationToken ct = default)
+        {
+            var extraArgs = new List<string>
+            {
+                "--headlineLimit", headlineLimit.ToString()
+            };
+
+            return RunAsync("perception", "snapshot", extraArgs, timeoutMs, ct);
+        }
+
+        /// <summary>
         /// Convenience: read Parquet data for a symbol from the local data lake.
         /// Returns the raw ProcessResult — caller parses JSON from Stdout.
         /// </summary>

@@ -69,6 +69,33 @@ public sealed record MarketDataEvent : AlephEvent
 }
 
 /// <summary>
+/// Blood cell representing a perception refresh — macro proxies, calendar, headlines.
+/// Published by the MarketIngestionOrchestrator after running perception ingest.
+/// </summary>
+public sealed record PerceptionRefreshEvent : AlephEvent
+{
+    public required bool Success { get; init; }
+    public required long DurationMs { get; init; }
+
+    // Macro proxies
+    public int ProxiesSucceeded { get; init; }
+    public int ProxiesTotal { get; init; }
+
+    // Calendar
+    public bool CalendarOk { get; init; }
+    public string? CalendarProvider { get; init; }
+    public int CalendarEventCount { get; init; }
+
+    // Headlines
+    public bool HeadlinesOk { get; init; }
+    public string? HeadlinesProvider { get; init; }
+    public int HeadlineCount { get; init; }
+
+    public string? ManifestPath { get; init; }
+    public string? ErrorMessage { get; init; }
+}
+
+/// <summary>
 /// Blood cell summarizing one completed Sleep Cycle (resolve → train).
 /// Published by SleepCycleService at the end of each cycle for observability.
 /// v2: adds cycle numbering, scorecard fields, stall detection, evaluation results.
