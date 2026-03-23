@@ -19,6 +19,8 @@ Flags:
   --full       Show calibration curve and full scorecard detail
   --evaluate   Run challenger evaluation and show results
   --json       Output raw JSON instead of formatted text
+
+Compatible with Python 3.10+.
 """
 
 from __future__ import annotations
@@ -62,35 +64,40 @@ _WHITE = "\033[37m"
 
 
 def _color(text: str, code: str) -> str:
-    return f"{code}{text}{_RESET}"
+    return "{}{}{}".format(code, text, _RESET)
 
 
 def _header(title: str) -> str:
-    line = "─" * 60
-    return f"\n{_color(line, _DIM)}\n{_color(f'  {title}', _BOLD + _CYAN)}\n{_color(line, _DIM)}"
+    line = "\u2500" * 60
+    dim_line = _color(line, _DIM)
+    bold_title = _color("  " + title, _BOLD + _CYAN)
+    return "\n{}\n{}\n{}".format(dim_line, bold_title, dim_line)
 
 
 def _kv(key: str, value, warn: bool = False, good: bool = False) -> str:
     color = _RED if warn else (_GREEN if good else _WHITE)
-    return f"  {_color(key + ':', _DIM)}  {_color(str(value), color)}"
+    label = _color(key + ":", _DIM)
+    val = _color(str(value), color)
+    return "  {}  {}".format(label, val)
 
 
 def _bar(value: float, width: int = 20, label: str = "") -> str:
     """Render a simple horizontal bar chart."""
     filled = int(value * width)
-    bar = "█" * filled + "░" * (width - filled)
-    pct = f"{value:.0%}"
-    return f"  {bar} {pct} {_color(label, _DIM)}"
+    bar = "\u2588" * filled + "\u2591" * (width - filled)
+    pct = "{:.0%}".format(value)
+    dim_label = _color(label, _DIM)
+    return "  {} {} {}".format(bar, pct, dim_label)
 
 
 def _health_indicator(level: str) -> str:
     if level == "healthy":
-        return _color("● HEALTHY", _GREEN + _BOLD)
+        return _color("\u25cf HEALTHY", _GREEN + _BOLD)
     elif level == "degraded":
-        return _color("● DEGRADED", _YELLOW + _BOLD)
+        return _color("\u25cf DEGRADED", _YELLOW + _BOLD)
     elif level == "critical":
-        return _color("● CRITICAL", _RED + _BOLD)
-    return _color("● UNKNOWN", _DIM)
+        return _color("\u25cf CRITICAL", _RED + _BOLD)
+    return _color("\u25cf UNKNOWN", _DIM)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -178,7 +185,7 @@ def collect_model_status(symbol: str, horizon: str) -> dict:
     }
 
 
-def collect_scorecard(symbol: str, horizon: str) -> dict | None:
+def collect_scorecard(symbol: str, horizon: str):
     """Compute rolling scorecard if enough resolved data."""
     samples = load_resolved_samples(symbol, horizon)
     if not samples:
@@ -191,7 +198,7 @@ def assess_health(
     resolved: dict,
     cursor: dict,
     model: dict,
-    scorecard: dict | None,
+    scorecard,
 ) -> dict:
     """Produce a high-level health assessment."""
     issues = []
@@ -207,11 +214,11 @@ def assess_health(
 
     # Pending backlog
     if pending["total"] > 100:
-        issues.append(f"large_pending_backlog:{pending['total']}")
+        issues.append("large_pending_backlog:{}".format(pending["total"]))
         level = "degraded"
 
     if pending["oldest_hours"] > 168:  # 7 days
-        issues.append(f"stale_pending:{pending['oldest_hours']:.0f}h")
+        issues.append("stale_pending:{:.0f}h".format(pending["oldest_hours"]))
         level = "degraded"
 
     # Cursor stall
@@ -224,10 +231,10 @@ def assess_health(
         brier = scorecard.get("mean_brier_score", 0)
         acc = scorecard.get("accuracy", 0)
         if brier > 0.4:
-            issues.append(f"high_brier:{brier:.3f}")
+            issues.append("high_brier:{:.3f}".format(brier))
             level = "degraded"
         if acc < 0.25:
-            issues.append(f"very_low_accuracy:{acc:.3f}")
+            issues.append("very_low_accuracy:{:.3f}".format(acc))
             level = "critical"
         if scorecard.get("drift", {}).get("detected"):
             issues.append("drift_detected")
@@ -257,7 +264,7 @@ def render_dashboard(
     resolved: dict,
     cursor: dict,
     model: dict,
-    scorecard: dict | None,
+    scorecard,
     health: dict,
     full: bool = False,
 ) -> str:
@@ -265,23 +272,32 @@ def render_dashboard(
     lines = []
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+    title = "  ALEPH CORTEX DASHBOARD \u2014 {}/{}".format(symbol, horizon)
     lines.append("")
-    lines.append(_color(f"  ALEPH CORTEX DASHBOARD — {symbol}/{horizon}", _BOLD + _MAGENTA))
-    lines.append(_color(f"  {now_str}", _DIM))
-    lines.append(f"  Health: {_health_indicator(health['level'])}")
+    lines.append(_color(title, _BOLD + _MAGENTA))
+    lines.append(_color("  " + now_str, _DIM))
+    health_level = health["level"]
+    lines.append("  Health: {}".format(_health_indicator(health_level)))
     if health["issues"]:
         for issue in health["issues"]:
-            lines.append(f"    {_color('!', _YELLOW)} {issue}")
+            bang = _color("!", _YELLOW)
+            lines.append("    {} {}".format(bang, issue))
 
     # ── Model ──
     lines.append(_header("Model"))
-    state_color = _GREEN if model["state"] == "active" else (_YELLOW if model["state"] == "warming" else _RED)
-    lines.append(f"  State:    {_color(model['state'], state_color)}")
+    model_state = model["state"]
+    if model_state == "active":
+        state_color = _GREEN
+    elif model_state == "warming":
+        state_color = _YELLOW
+    else:
+        state_color = _RED
+    lines.append("  State:    {}".format(_color(model_state, state_color)))
     lines.append(_kv("Version", model["version"]))
-    lines.append(_kv("Trained", f"{model['trained_samples']} samples"))
+    lines.append(_kv("Trained", "{} samples".format(model["trained_samples"])))
     if model["class_distribution"]:
-        dist = model["class_distribution"]
-        lines.append(f"  Classes:  {_color(json.dumps(dist), _DIM)}")
+        dist_str = json.dumps(model["class_distribution"])
+        lines.append("  Classes:  {}".format(_color(dist_str, _DIM)))
 
     # ── Pending Memory ──
     lines.append(_header("Pending Memory"))
@@ -292,21 +308,25 @@ def render_dashboard(
     lines.append(_kv("Blocked", pending["blocked"],
                       warn=pending["blocked"] > pending["eligible"]))
     if pending["total"] > 0:
-        lines.append(_kv("Age (oldest)", f"{pending['oldest_hours']}h",
+        lines.append(_kv("Age (oldest)", "{}h".format(pending["oldest_hours"]),
                           warn=pending["oldest_hours"] > 168))
-        lines.append(_kv("Age (newest)", f"{pending['newest_hours']}h"))
-        lines.append(_kv("Age (median)", f"{pending['median_hours']}h"))
+        lines.append(_kv("Age (newest)", "{}h".format(pending["newest_hours"])))
+        lines.append(_kv("Age (median)", "{}h".format(pending["median_hours"])))
 
     # ── Resolved Archive ──
     lines.append(_header("Resolved Archive"))
     lines.append(_kv("Total", resolved["total"],
                       good=resolved["total"] > 30))
     if resolved["total"] > 0:
-        lines.append(_kv("Archive accuracy", f"{resolved['archive_accuracy']:.1%}",
-                          warn=resolved["archive_accuracy"] < 0.3,
-                          good=resolved["archive_accuracy"] >= 0.5))
-        lines.append(f"  Labels:      {_color(json.dumps(resolved['label_distribution']), _DIM)}")
-        lines.append(f"  Predictions: {_color(json.dumps(resolved['predicted_distribution']), _DIM)}")
+        acc = resolved["archive_accuracy"]
+        acc_str = "{:.1%}".format(acc)
+        lines.append(_kv("Archive accuracy", acc_str,
+                          warn=acc < 0.3,
+                          good=acc >= 0.5))
+        label_str = json.dumps(resolved["label_distribution"])
+        pred_str = json.dumps(resolved["predicted_distribution"])
+        lines.append("  Labels:      {}".format(_color(label_str, _DIM)))
+        lines.append("  Predictions: {}".format(_color(pred_str, _DIM)))
 
     # ── Training Cursor ──
     lines.append(_header("Training Cursor"))
@@ -326,12 +346,18 @@ def render_dashboard(
     else:
         brier = scorecard["mean_brier_score"]
         acc = scorecard["accuracy"]
-        lines.append(_kv("Window", f"{scorecard.get('window_actual', '?')}/{scorecard.get('window_size', '?')} samples"))
-        lines.append(_kv("Brier score", f"{brier:.4f}",
+        window_actual = scorecard.get("window_actual", "?")
+        window_size = scorecard.get("window_size", "?")
+        window_str = "{}/{} samples".format(window_actual, window_size)
+        lines.append(_kv("Window", window_str))
+        brier_str = "{:.4f}".format(brier)
+        lines.append(_kv("Brier score", brier_str,
                           warn=brier > 0.35, good=brier < 0.25))
-        lines.append(_kv("Accuracy", f"{acc:.1%}",
+        acc_str = "{:.1%}".format(acc)
+        lines.append(_kv("Accuracy", acc_str,
                           warn=acc < 0.3, good=acc >= 0.5))
-        lines.append(_kv("Calibration gap", f"{scorecard.get('mean_calibration_gap', 0):.4f}"))
+        cal_gap = scorecard.get("mean_calibration_gap", 0)
+        lines.append(_kv("Calibration gap", "{:.4f}".format(cal_gap)))
 
         # Grade buckets
         buckets = scorecard.get("grade_buckets", {})
@@ -339,38 +365,52 @@ def render_dashboard(
             total_b = sum(buckets.values())
             for bucket, count in buckets.items():
                 pct = count / total_b if total_b > 0 else 0
-                lines.append(f"    {bucket:20s} {count:4d}  ({pct:.0%})")
+                lines.append("    {:20s} {:4d}  ({:.0%})".format(bucket, count, pct))
 
         # Streak
         streak = scorecard.get("current_streak", {})
-        if streak.get("length", 0) > 0:
-            streak_color = _GREEN if streak["type"] == "correct" else _RED
-            lines.append(f"  Streak:  {_color(f'{streak[\"type\"]} x{streak[\"length\"]}', streak_color)}")
+        streak_len = streak.get("length", 0)
+        if streak_len > 0:
+            streak_type = streak.get("type", "?")
+            streak_color = _GREEN if streak_type == "correct" else _RED
+            streak_text = "{} x{}".format(streak_type, streak_len)
+            lines.append("  Streak:  {}".format(_color(streak_text, streak_color)))
 
         # Drift
         drift = scorecard.get("drift", {})
         if drift.get("detected"):
-            lines.append(f"  {_color('DRIFT DETECTED', _RED + _BOLD)}: {', '.join(drift.get('flags', []))}")
-            lines.append(f"    Brier shift:    {drift.get('brier_shift', 0):+.4f}")
-            lines.append(f"    Accuracy shift: {drift.get('accuracy_shift', 0):+.4f}")
+            drift_flags = ", ".join(drift.get("flags", []))
+            drift_label = _color("DRIFT DETECTED", _RED + _BOLD)
+            lines.append("  {}: {}".format(drift_label, drift_flags))
+            brier_shift = drift.get("brier_shift", 0)
+            acc_shift = drift.get("accuracy_shift", 0)
+            lines.append("    Brier shift:    {:+.4f}".format(brier_shift))
+            lines.append("    Accuracy shift: {:+.4f}".format(acc_shift))
 
         # Warnings
         warnings = scorecard.get("warnings", [])
         if warnings:
-            lines.append(f"  Warnings ({len(warnings)}):")
+            lines.append("  Warnings ({}):".format(len(warnings)))
             for w in warnings:
-                lines.append(f"    {_color('!', _YELLOW)} {w}")
+                bang = _color("!", _YELLOW)
+                lines.append("    {} {}".format(bang, w))
 
         # Full mode: calibration curve
         if full and scorecard.get("calibration"):
             lines.append("")
             lines.append(_color("  Calibration Curve:", _BOLD))
-            lines.append(f"  {'Bin':>12s}  {'Count':>5s}  {'Predicted':>9s}  {'Actual':>7s}  {'Gap':>5s}")
+            lines.append("  {:>12s}  {:>5s}  {:>9s}  {:>7s}  {:>5s}".format(
+                "Bin", "Count", "Predicted", "Actual", "Gap"))
             for b in scorecard["calibration"]:
-                bin_label = f"{b['bin_lower']:.2f}-{b['bin_upper']:.2f}"
+                bin_label = "{:.2f}-{:.2f}".format(b["bin_lower"], b["bin_upper"])
+                b_count = b["count"]
+                b_pred = b["mean_predicted_prob"]
+                b_actual = b["actual_hit_rate"]
+                b_gap = b["gap"]
                 lines.append(
-                    f"  {bin_label:>12s}  {b['count']:5d}  "
-                    f"{b['mean_predicted_prob']:9.4f}  {b['actual_hit_rate']:7.4f}  {b['gap']:5.4f}"
+                    "  {:>12s}  {:5d}  {:9.4f}  {:7.4f}  {:5.4f}".format(
+                        bin_label, b_count, b_pred, b_actual, b_gap
+                    )
                 )
 
     # ── Active Policies ──
@@ -381,7 +421,7 @@ def render_dashboard(
         lines.append(_kv(name, version))
 
     lines.append("")
-    lines.append(_color("─" * 60, _DIM))
+    lines.append(_color("\u2500" * 60, _DIM))
     return "\n".join(lines)
 
 
@@ -400,8 +440,9 @@ def render_evaluation_summary(eval_result: dict) -> str:
     lines.append(_kv("Challengers", evaluation.get("challengers_evaluated", "?")))
 
     summary = evaluation.get("summary", {})
-    lines.append(_kv("Promote", summary.get("promote", 0),
-                      good=summary.get("promote", 0) > 0))
+    promote_count = summary.get("promote", 0)
+    lines.append(_kv("Promote", promote_count,
+                      good=promote_count > 0))
     lines.append(_kv("Reject", summary.get("reject", 0)))
     lines.append(_kv("Inconclusive", summary.get("inconclusive", 0)))
 
@@ -415,28 +456,41 @@ def render_evaluation_summary(eval_result: dict) -> str:
         name = comp.get("challenger_name", "?")
         decision = comp.get("promotion_decision", {})
         dec = decision.get("decision", "?")
-        dec_color = _GREEN if dec == "promote" else (_RED if dec == "reject" else _YELLOW)
+        if dec == "promote":
+            dec_color = _GREEN
+        elif dec == "reject":
+            dec_color = _RED
+        else:
+            dec_color = _YELLOW
 
         lines.append("")
-        lines.append(f"  {_color(name, _BOLD)}  →  {_color(dec.upper(), dec_color)}")
+        name_colored = _color(name, _BOLD)
+        dec_colored = _color(dec.upper(), dec_color)
+        lines.append("  {}  \u2192  {}".format(name_colored, dec_colored))
 
         delta = comp.get("delta", {})
         brier_diff = delta.get("brier_score_diff")
         acc_diff = delta.get("accuracy_diff")
         if brier_diff is not None:
             improvement = -brier_diff
-            lines.append(f"    Brier improvement: {_color(f'{improvement:+.4f}', _GREEN if improvement > 0 else _RED)}")
+            imp_color = _GREEN if improvement > 0 else _RED
+            imp_str = _color("{:+.4f}".format(improvement), imp_color)
+            lines.append("    Brier improvement: {}".format(imp_str))
         if acc_diff is not None:
-            lines.append(f"    Accuracy change:   {_color(f'{acc_diff:+.4f}', _GREEN if acc_diff > 0 else _RED)}")
+            acc_color = _GREEN if acc_diff > 0 else _RED
+            acc_str = _color("{:+.4f}".format(acc_diff), acc_color)
+            lines.append("    Accuracy change:   {}".format(acc_str))
 
         reasons = decision.get("reasons", [])
         if reasons:
-            lines.append(f"    Reasons: {', '.join(reasons[:3])}")
+            reasons_str = ", ".join(reasons[:3])
+            lines.append("    Reasons: {}".format(reasons_str))
 
         vetoes = decision.get("vetoes", [])
         if vetoes:
             for v in vetoes:
-                lines.append(f"    {_color('VETO', _RED)}: {v}")
+                veto_label = _color("VETO", _RED)
+                lines.append("    {}: {}".format(veto_label, v))
 
     lines.append("")
     return "\n".join(lines)
@@ -490,7 +544,7 @@ def collect_all_as_json(symbol: str, horizon: str, run_eval: bool = False) -> di
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Aleph Cortex Dashboard — operational diagnostics CLI",
+        description="Aleph Cortex Dashboard \u2014 operational diagnostics CLI",
     )
     parser.add_argument("--symbol", default="BTCUSDT", help="Trading symbol")
     parser.add_argument("--horizon", default="1d", help="Prediction horizon")
