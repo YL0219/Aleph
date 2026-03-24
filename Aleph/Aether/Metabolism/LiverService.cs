@@ -24,6 +24,7 @@ public sealed class LiverService : BackgroundService, IAlephOrgan
 
     private readonly IAlephBus _bus;
     private readonly IAether _aether;
+    private readonly PerceptionSnapshotCache _perceptionCache;
     private readonly MetabolicArtifactWriter _artifactWriter;
     private readonly ILogger<LiverService> _logger;
 
@@ -39,11 +40,13 @@ public sealed class LiverService : BackgroundService, IAlephOrgan
     public LiverService(
         IAlephBus bus,
         IAether aether,
+        PerceptionSnapshotCache perceptionCache,
         MetabolicArtifactWriter artifactWriter,
         ILogger<LiverService> logger)
     {
         _bus = bus;
         _aether = aether;
+        _perceptionCache = perceptionCache;
         _artifactWriter = artifactWriter;
         _logger = logger;
     }
@@ -190,7 +193,27 @@ public sealed class LiverService : BackgroundService, IAlephOrgan
             }
 
             // ── Step 4: Build MetabolicEvent from canonical output ──
-            var metabolicEvent = BuildMetabolicEvent(mde, root);
+            //
+            // The perception cache provides the current macro context (proxies,
+            // calendar, headlines) read from the local data lake. The cache is
+            // shared across all symbols in an ingestion batch — one disk read,
+            // many events enriched.
+            //
+            MetabolicMacroContext? macroCtx = null;
+            MetabolicContextCoverage? coverage = null;
+            try
+            {
+                macroCtx = _perceptionCache.GetSnapshot();
+                coverage = BuildCoverage(macroCtx);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex,
+                    "[Liver] Perception snapshot unavailable for {Symbol}. Proceeding without macro context.",
+                    mde.Symbol);
+            }
+
+            var metabolicEvent = BuildMetabolicEvent(mde, root, macroCtx, coverage);
 
             // ── Step 5: Persist the metabolized artifact ──
             string? artifactPath = null;
@@ -228,7 +251,11 @@ public sealed class LiverService : BackgroundService, IAlephOrgan
 
     // ─── JSON → MetabolicEvent Mapping ───────────────────────────────
 
-    private static MetabolicEvent BuildMetabolicEvent(MarketDataEvent mde, JsonElement root)
+    private static MetabolicEvent BuildMetabolicEvent(
+        MarketDataEvent mde,
+        JsonElement root,
+        MetabolicMacroContext? macroContext,
+        MetabolicContextCoverage? coverage)
     {
         var asof = SafeString(root, "asof_utc") ?? DateTimeOffset.UtcNow.ToString("o");
         var dataQuality = root.TryGetProperty("data_quality", out var dq) ? dq : default;
@@ -282,6 +309,44 @@ public sealed class LiverService : BackgroundService, IAlephOrgan
             Risks = ParseStringArray(conclusionEl, "risks"),
 
             RecentWindows = ParseRecentWindows(windowsEl),
+            MacroContext = macroContext,
+            ContextCoverage = coverage,
+        };
+    }
+
+    /// <summary>
+    /// Build context coverage from the macro context sections.
+    /// Reports which perception sections were available.
+    /// </summary>
+    private static MetabolicContextCoverage BuildCoverage(MetabolicMacroContext? macro)
+    {
+        if (macro is null)
+        {
+            return new MetabolicContextCoverage
+            {
+                MissingContextReasons = new[] { "perception_snapshot_unavailable" },
+            };
+        }
+
+        var missing = new List<string>();
+
+        bool hadProxies = macro.Sections.TryGetValue("proxies", out var p)
+                          && p.Status is "fresh" or "stale";
+        bool hadCalendar = macro.Sections.TryGetValue("calendar", out var c)
+                           && c.Status is "fresh" or "stale";
+        bool hadHeadlines = macro.Sections.TryGetValue("headlines", out var h)
+                            && h.Status is "fresh" or "stale";
+
+        if (!hadProxies) missing.Add("proxies_missing");
+        if (!hadCalendar) missing.Add("calendar_missing");
+        if (!hadHeadlines) missing.Add("headlines_missing");
+
+        return new MetabolicContextCoverage
+        {
+            HadProxyContext = hadProxies,
+            HadCalendarContext = hadCalendar,
+            HadHeadlineContext = hadHeadlines,
+            MissingContextReasons = missing.AsReadOnly(),
         };
     }
 

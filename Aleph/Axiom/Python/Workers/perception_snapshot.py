@@ -21,10 +21,42 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone, timedelta
 from typing import Any
+
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+
+def _sanitize_for_json(value: Any) -> Any:
+    """Recursively map NaN/NA-like values to None for strict JSON output."""
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_json(v) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_json(v) for v in value]
+
+    if value is None:
+        return None
+
+    if isinstance(value, float) and math.isnan(value):
+        return None
+
+    if pd is not None:
+        try:
+            if bool(pd.isna(value)):
+                return None
+        except Exception:
+            pass
+
+    return value
 
 
 # ── Constants ────────────────────────────────────────────────────────
@@ -98,9 +130,7 @@ def read_proxy_summaries(proxy_names: list[str] | None = None) -> dict[str, Any]
     names = proxy_names or DEFAULT_PROXY_NAMES
     summaries = {}
 
-    try:
-        import pandas as pd
-    except ImportError:
+    if pd is None:
         _log("pandas not available — skipping proxy summaries")
         return {"available": False, "error": "pandas not installed", "proxies": {}}
 
@@ -269,10 +299,10 @@ def main(argv=None):
 
     try:
         snapshot = build_snapshot(args.headlineLimit)
-        print(json.dumps(snapshot, default=str))
+        print(json.dumps(_sanitize_for_json(snapshot), default=str, allow_nan=False))
     except Exception as e:
         _log("Fatal error: {}".format(e))
-        print(json.dumps({"ok": False, "error": str(e)}))
+        print(json.dumps(_sanitize_for_json({"ok": False, "error": str(e)}), allow_nan=False))
         sys.exit(1)
 
 

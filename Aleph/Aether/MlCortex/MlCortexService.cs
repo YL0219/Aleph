@@ -356,6 +356,13 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
         return section;
     }
 
+    /// <summary>
+    /// Build the macro section for the Python payload.
+    ///
+    /// New design (Phase 10.5): C# passes raw perception data as named sections.
+    /// Python interprets the payload contents. To add new sections, update the
+    /// perception pipeline and PerceptionSnapshotCache — this method adapts automatically.
+    /// </summary>
     private static Dictionary<string, object?> BuildMacroSection(MetabolicMacroContext? macro)
     {
         var section = new Dictionary<string, object?>();
@@ -363,103 +370,72 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
         if (macro is null)
             return section;
 
-        // Cross-asset scores
-        var ca = macro.CrossAsset;
-        if (ca is not null)
+        // Envelope metadata — Python can use this for governance/freshness checks
+        section["_meta"] = new Dictionary<string, object?>
         {
-            section["cross_asset"] = new Dictionary<string, object?>
-            {
-                ["as_of_utc"] = ca.AsOfUtc,
-                ["equities_risk"] = ca.EquitiesRiskScore,
-                ["bonds_risk"] = ca.BondsRiskScore,
-                ["gold_strength"] = ca.GoldStrengthScore,
-                ["silver_strength"] = ca.SilverStrengthScore,
-                ["dollar_pressure"] = ca.DollarPressureScore,
-                ["volatility_pressure"] = ca.VolatilityPressureScore,
-                ["crypto_risk"] = ca.CryptoRiskScore,
-                ["liquidity_stress"] = ca.LiquidityStressScore,
-                ["correlation_stress"] = ca.CorrelationStressScore,
-                ["coverage"] = ca.CoverageScore,
-            };
-        }
+            ["snapshot_at_utc"] = macro.SnapshotAtUtc,
+            ["freshness"] = macro.Freshness,
+            ["sections_available"] = macro.SectionsAvailable,
+            ["any_stale"] = macro.AnyStale,
+            ["manifest_present"] = macro.ManifestPresent,
+        };
 
-        // Regime hints
-        var rh = macro.RegimeHints;
-        if (rh is not null)
+        // Pass each section's raw payload through.
+        // C# is opaque transport — Python interprets the JSON inside.
+        foreach (var (name, sect) in macro.Sections)
         {
-            section["regime_hints"] = new Dictionary<string, object?>
+            if (string.IsNullOrEmpty(sect.PayloadJson))
             {
-                ["risk_on"] = rh.RiskOnProbability,
-                ["risk_off"] = rh.RiskOffProbability,
-                ["inflation_pressure"] = rh.InflationPressureProbability,
-                ["growth_scare"] = rh.GrowthScareProbability,
-                ["policy_shock"] = rh.PolicyShockProbability,
-                ["flight_to_safety"] = rh.FlightToSafetyProbability,
-                ["confidence"] = rh.RegimeConfidence,
-            };
-        }
+                // Section exists but has no data — include status only
+                section[name] = new Dictionary<string, object?>
+                {
+                    ["_status"] = sect.Status,
+                };
+                continue;
+            }
 
-        section["macro_tags"] = macro.MacroTags;
+            try
+            {
+                // Deserialize the raw JSON so it embeds naturally (no double-escaping)
+                var payload = JsonSerializer.Deserialize<JsonElement>(sect.PayloadJson);
+
+                // Wrap in a dict with status metadata + the raw payload
+                section[name] = new Dictionary<string, object?>
+                {
+                    ["_status"] = sect.Status,
+                    ["_fetched_at_utc"] = sect.FetchedAtUtc,
+                    ["_provider"] = sect.Provider,
+                    ["data"] = payload,
+                };
+            }
+            catch
+            {
+                section[name] = new Dictionary<string, object?>
+                {
+                    ["_status"] = "error",
+                    ["_error"] = "payload_parse_failed",
+                };
+            }
+        }
 
         return section;
     }
 
+    /// <summary>
+    /// Build the events section for the Python payload.
+    ///
+    /// With Phase 10.5, raw calendar and headline data flows through the macro
+    /// section. This events section is kept for backwards compatibility — downstream
+    /// feature extraction that reads events.materiality etc. gets safe 0.0 defaults.
+    /// Future feature adapters should read from macro.calendar and macro.headlines instead.
+    /// </summary>
     private static Dictionary<string, object?> BuildEventsSection(MetabolicMacroContext? macro)
     {
-        var section = new Dictionary<string, object?>();
-
-        if (macro is null)
-            return section;
-
-        // Scheduled catalysts
-        var sched = macro.Scheduled;
-        if (sched is not null)
-        {
-            var catalysts = new List<Dictionary<string, object?>>();
-            foreach (var c in sched.UpcomingCatalysts)
-            {
-                catalysts.Add(new Dictionary<string, object?>
-                {
-                    ["event_type"] = c.EventType,
-                    ["scheduled_for_utc"] = c.ScheduledForUtc,
-                    ["knowledge_utc"] = c.KnowledgeUtc,
-                    ["priority_probability"] = c.PriorityProbability,
-                    ["affected_assets"] = c.ExpectedAffectedAssets,
-                });
-            }
-            section["scheduled_catalysts"] = catalysts;
-            section["high_priority_within_24h"] = sched.HighPriorityEventWithin24h;
-            section["schedule_tension"] = sched.ScheduleTensionScore;
-        }
-
-        // Headlines
-        var hl = macro.Headlines;
-        if (hl is not null)
-        {
-            section["headline_tags"] = hl.ActiveTags;
-            section["headline_refs"] = hl.HeadlineRefs;
-            section["headline_count"] = hl.HeadlineCount;
-            section["materiality"] = hl.MaterialityScore;
-            section["shock"] = hl.ShockScore;
-            section["source_diversity"] = hl.SourceDiversityScore;
-            section["headline_knowledge_utc"] = hl.MaxIncludedKnowledgeUtc;
-        }
-
-        // Crypto stress
-        var cs = macro.CryptoStress;
-        if (cs is not null)
-        {
-            section["crypto_stress"] = new Dictionary<string, object?>
-            {
-                ["as_of_utc"] = cs.AsOfUtc,
-                ["risk"] = cs.CryptoRiskScore,
-                ["volatility"] = cs.CryptoVolatilityScore,
-                ["weekend_stress"] = cs.WeekendStressScore,
-                ["stablecoin_stress"] = cs.StablecoinStressScore,
-            };
-        }
-
-        return section;
+        // Backwards-compatible empty section.
+        // Old feature_adapter paths (events.materiality, events.shock, etc.)
+        // will find None → 0.0 defaults. Raw data is available in macro.calendar
+        // and macro.headlines for future feature extraction.
+        return new Dictionary<string, object?>();
     }
 
     // ═════════════════════════════════════════════════════════════════

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Globalization;
 using Microsoft.EntityFrameworkCore;
@@ -1162,6 +1163,10 @@ public sealed class Axiom : IAxiom
     {
         private const int IngestTimeoutMs = 120_000; // 2 min — fetches 7 proxies + calendar + headlines
         private const int SnapshotTimeoutMs = 15_000; // local reads only
+        private static readonly JsonSerializerOptions PerceptionJsonOptions = new()
+        {
+            NumberHandling = JsonNumberHandling.AllowNamedFloatingPointLiterals
+        };
 
         private readonly Axiom _root;
 
@@ -1196,8 +1201,11 @@ public sealed class Axiom : IAxiom
 
             try
             {
-                using var doc = JsonDocument.Parse(result.Stdout);
-                var root = doc.RootElement;
+                var root = JsonSerializer.Deserialize<JsonElement>(result.Stdout, PerceptionJsonOptions);
+                if (root.ValueKind != JsonValueKind.Object)
+                {
+                    throw new JsonException("Perception ingest report root must be a JSON object.");
+                }
 
                 var proxies = root.GetProperty("proxies");
                 var calendar = root.GetProperty("calendar");

@@ -4,6 +4,22 @@ feature_adapter.py - Maps nested metabolic payload to a fixed-order feature vect
 v2: Reads from the nested payload structure (technical/macro/events sections).
 The feature order is canonical and must be stable across model versions.
 New features should be appended, never inserted, to maintain compatibility.
+
+Phase 10.5 note:
+  The macro section now carries raw perception data as named subsections:
+    macro.proxies.data  — proxy latest closes (VIX, DXY, BTC, SPY, QQQ, TLT, GLD)
+    macro.calendar.data — economic calendar events (FOMC, CPI, NFP, GDP)
+    macro.headlines.data — macro news headlines with tags
+  Each subsection has _status / _fetched_at_utc metadata.
+
+  The OLD v2 macro feature paths (cross_asset, regime_hints, events.materiality etc.)
+  are backwards-compatible: they resolve to None → 0.0 defaults until a future v3
+  adapter computes features from the raw perception data.
+
+  To add new macro features from perception data:
+    1. Add a _extract_perception_features() helper below
+    2. Append new feature names to FEATURE_NAMES (never insert)
+    3. Update feature_count() and the model
 """
 
 import math

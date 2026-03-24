@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -44,24 +45,50 @@ from datetime import datetime, timezone, timedelta
 from typing import Any
 
 
+def _sanitize_for_json(value: Any) -> Any:
+    """Recursively map NaN/NA-like values to None for strict JSON output."""
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_json(v) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_json(v) for v in value]
+
+    if value is None:
+        return None
+
+    if isinstance(value, float) and math.isnan(value):
+        return None
+
+    pandas_module = globals().get("pd")
+    if pandas_module is not None:
+        try:
+            if bool(pandas_module.isna(value)):
+                return None
+        except Exception:
+            pass
+
+    return value
+
+
 # ── Dependency checks ────────────────────────────────────────────────
 
 try:
     import yfinance as yf
 except ImportError:
-    print(json.dumps({"ok": False, "error": "yfinance is not installed"}))
+    print(json.dumps(_sanitize_for_json({"ok": False, "error": "yfinance is not installed"}), allow_nan=False))
     sys.exit(1)
 
 try:
     import pandas as pd
 except ImportError:
-    print(json.dumps({"ok": False, "error": "pandas is not installed"}))
+    print(json.dumps(_sanitize_for_json({"ok": False, "error": "pandas is not installed"}), allow_nan=False))
     sys.exit(1)
 
 try:
     import pyarrow  # noqa: F401
 except ImportError:
-    print(json.dumps({"ok": False, "error": "pyarrow is not installed"}))
+    print(json.dumps(_sanitize_for_json({"ok": False, "error": "pyarrow is not installed"}), allow_nan=False))
     sys.exit(1)
 
 
@@ -79,6 +106,7 @@ DEFAULT_PROXY_MAP = {
 }
 
 PROXY_OUT_ROOT = "data_lake/macro/proxies"
+PROXY_SUMMARY_PATH = "data_lake/macro/proxies/summary.json"
 CALENDAR_OUT_PATH = "data_lake/macro/calendar/latest.json"
 HEADLINES_OUT_PATH = "data_lake/macro/headlines/latest.json"
 MANIFEST_OUT_PATH = "data_lake/perception/manifest.json"
@@ -129,7 +157,14 @@ def _write_json_atomic(data: Any, path: str) -> str:
     os.close(fd)
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str, ensure_ascii=False)
+            json.dump(
+                _sanitize_for_json(data),
+                f,
+                indent=2,
+                default=str,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
         shutil.move(tmp_path, path)
     except Exception:
         if os.path.exists(tmp_path):
@@ -162,6 +197,7 @@ def fetch_macro_proxies(
             "parquetPath": "",
             "dataStartUtc": None,
             "dataEndUtc": None,
+            "latestClose": None,
             "error": None,
         }
 
@@ -201,6 +237,7 @@ def fetch_macro_proxies(
             result["parquetPath"] = parquet_path.replace("\\", "/")
             result["dataStartUtc"] = data_start
             result["dataEndUtc"] = data_end
+            result["latestClose"] = float(df["close"].iloc[-1])
 
             _log("  {} — {} rows -> {}".format(ticker, len(df), parquet_path))
 
@@ -678,6 +715,25 @@ def main(argv=None):
                 "isSuccess": False, "rowsWritten": 0, "parquetPath": "",
                 "error": str(e),
             }]
+        # Write proxy summary JSON for direct C# consumption (no parquet reader needed)
+        try:
+            summary = {
+                "fetchedAtUtc": _iso(started),
+                "proxies": {
+                    r["lakeName"]: {
+                        "available": r["isSuccess"],
+                        "ticker": r["ticker"],
+                        "latestClose": r.get("latestClose"),
+                        "rows": r["rowsWritten"],
+                        "dataEndUtc": r.get("dataEndUtc"),
+                    }
+                    for r in proxy_results
+                },
+            }
+            _write_json_atomic(summary, PROXY_SUMMARY_PATH)
+            _log("Proxy summary -> {}".format(PROXY_SUMMARY_PATH))
+        except Exception as e:
+            _log("Failed to write proxy summary: {}".format(e))
     else:
         _log("Skipping macro proxies (--skipProxies)")
 
@@ -751,7 +807,7 @@ def main(argv=None):
     }
 
     _log("Perception ingest complete in {}ms".format(duration_ms))
-    print(json.dumps(report))
+    print(json.dumps(_sanitize_for_json(report), allow_nan=False))
 
 
 if __name__ == "__main__":

@@ -186,95 +186,84 @@ public sealed record MetabolicTemporalEnvelope
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// NEW: Macro Context — cross-asset, scheduled, headline, crypto
+// Macro Context — flexible envelope + opaque section payloads
+//
+// Design: C# is thin transport — it reads perception artifacts from disk,
+// packages them as named sections, and attaches freshness metadata.
+// Python feature extraction interprets the section payloads.
+//
+// To add a new perception section (e.g., sentiment, positioning):
+//   1. Write the data to the data lake in the perception pipeline
+//   2. Add a reader in PerceptionSnapshotCache
+//   3. The section flows through automatically — no C# recompilation downstream
 // ═════════════════════════════════════════════════════════════════════
 
 /// <summary>
-/// Macro-aware context enrichment carried as compact scores/tags only.
-/// No raw news text — only refs, tags, and pre-computed scores.
+/// Flexible macro context envelope. Carries raw perception data as named
+/// sections that C# transports and Python interprets.
 /// </summary>
 public sealed record MetabolicMacroContext
 {
-    public MetabolicCrossAssetSnapshot? CrossAsset { get; init; }
-    public MetabolicScheduledContext? Scheduled { get; init; }
-    public MetabolicHeadlineContext? Headlines { get; init; }
-    public MetabolicCryptoStressContext? CryptoStress { get; init; }
-    public MetabolicRegimeHints? RegimeHints { get; init; }
-    public IReadOnlyList<string> MacroTags { get; init; } = Array.Empty<string>();
+    /// <summary>When this snapshot was assembled by C#.</summary>
+    public required string SnapshotAtUtc { get; init; }
+
+    /// <summary>Overall freshness: "fresh", "stale", "partial", "missing", "error".</summary>
+    public required string Freshness { get; init; }
+
+    /// <summary>Whether the perception manifest was found on disk.</summary>
+    public bool ManifestPresent { get; init; }
+
+    /// <summary>True if any section is past its staleness threshold.</summary>
+    public bool AnyStale { get; init; }
+
+    /// <summary>Number of sections with usable data (status is "fresh" or "stale").</summary>
+    public int SectionsAvailable { get; init; }
+
+    /// <summary>
+    /// Named perception sections. Each section is independently versioned,
+    /// freshness-tracked, and carries an opaque JSON payload for Python consumption.
+    /// Adding new sections requires NO C# changes downstream.
+    /// </summary>
+    public IReadOnlyDictionary<string, MacroContextSection> Sections { get; init; }
+        = new Dictionary<string, MacroContextSection>();
 }
 
-public sealed record MetabolicCrossAssetSnapshot
+/// <summary>
+/// A single perception section within the macro context.
+/// C# observes the envelope (Name, Status, FetchedAtUtc); Python interprets PayloadJson.
+/// </summary>
+public sealed record MacroContextSection
 {
-    public required string AsOfUtc { get; init; }
-    public double? EquitiesRiskScore { get; init; }
-    public double? BondsRiskScore { get; init; }
-    public double? GoldStrengthScore { get; init; }
-    public double? SilverStrengthScore { get; init; }
-    public double? DollarPressureScore { get; init; }
-    public double? VolatilityPressureScore { get; init; }
-    public double? CryptoRiskScore { get; init; }
-    public double? LiquidityStressScore { get; init; }
-    public double? CorrelationStressScore { get; init; }
-    public double? CoverageScore { get; init; }
-}
+    /// <summary>Section identity: "proxies", "calendar", "headlines", etc.</summary>
+    public required string Name { get; init; }
 
-public sealed record MetabolicScheduledContext
-{
-    public IReadOnlyList<MetabolicKnownCatalyst> UpcomingCatalysts { get; init; } = Array.Empty<MetabolicKnownCatalyst>();
-    public bool HighPriorityEventWithin24h { get; init; }
-    public double? ScheduleTensionScore { get; init; }
-    public double? CalendarCoverageScore { get; init; }
-}
+    /// <summary>Section-level freshness: "fresh", "stale", "missing", "error".</summary>
+    public required string Status { get; init; }
 
-public sealed record MetabolicKnownCatalyst
-{
-    public required string CatalystId { get; init; }
-    public required string EventType { get; init; }
-    public required string ScheduledForUtc { get; init; }
-    public required string KnowledgeUtc { get; init; }
-    public required double PriorityProbability { get; init; }
-    public IReadOnlyList<string> ExpectedAffectedAssets { get; init; } = Array.Empty<string>();
-}
+    /// <summary>When this section's data was fetched from the external source.</summary>
+    public string? FetchedAtUtc { get; init; }
 
-public sealed record MetabolicHeadlineContext
-{
-    public IReadOnlyList<string> ActiveTags { get; init; } = Array.Empty<string>();
-    public IReadOnlyList<string> HeadlineRefs { get; init; } = Array.Empty<string>();
-    public int HeadlineCount { get; init; }
-    public double? MaterialityScore { get; init; }
-    public double? ShockScore { get; init; }
-    public double? SourceDiversityScore { get; init; }
-    public string? MaxIncludedKnowledgeUtc { get; init; }
-}
+    /// <summary>Data provider that produced this section.</summary>
+    public string? Provider { get; init; }
 
-public sealed record MetabolicCryptoStressContext
-{
-    public required string AsOfUtc { get; init; }
-    public double? CryptoRiskScore { get; init; }
-    public double? CryptoVolatilityScore { get; init; }
-    public double? WeekendStressScore { get; init; }
-    public double? StablecoinStressScore { get; init; }
-}
+    /// <summary>Non-fatal section-level warnings.</summary>
+    public IReadOnlyList<string> Warnings { get; init; } = Array.Empty<string>();
 
-public sealed record MetabolicRegimeHints
-{
-    public double? RiskOnProbability { get; init; }
-    public double? RiskOffProbability { get; init; }
-    public double? InflationPressureProbability { get; init; }
-    public double? GrowthScareProbability { get; init; }
-    public double? PolicyShockProbability { get; init; }
-    public double? FlightToSafetyProbability { get; init; }
-    public double? RegimeConfidence { get; init; }
+    /// <summary>
+    /// The actual section data as serialized JSON. C# treats this as opaque.
+    /// Python feature extraction reads the contents directly.
+    /// </summary>
+    public string? PayloadJson { get; init; }
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// NEW: Context Coverage — observability of what was/wasn't available
+// Context Coverage — observability of what was/wasn't available
 // ═════════════════════════════════════════════════════════════════════
 
 public sealed record MetabolicContextCoverage
 {
+    public bool HadProxyContext { get; init; }
+    public bool HadCalendarContext { get; init; }
     public bool HadHeadlineContext { get; init; }
-    public bool HadScheduledContext { get; init; }
-    public bool HadCryptoContext { get; init; }
     public IReadOnlyList<string> MissingContextReasons { get; init; } = Array.Empty<string>();
 }

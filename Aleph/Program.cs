@@ -57,6 +57,9 @@ builder.Services.AddHostedService<HeartbeatService>();
 // Kidneys — background persistence consumer for autonomic/heartbeat events.
 builder.Services.AddHostedService<AutonomicPersistenceService>();
 
+// Perception — cached accessor for macro context (proxies, calendar, headlines).
+builder.Services.AddSingleton<PerceptionSnapshotCache>();
+
 // Liver — metabolic processing organ. Digests MarketDataEvent → MetabolicEvent.
 builder.Services.AddSingleton<MetabolicArtifactWriter>();
 builder.Services.AddHostedService<LiverService>();
