@@ -284,6 +284,25 @@ public sealed class Aether : IAether
 
             return _root.RunAsync("ml", "cortex_evaluate", args, 180_000, ct);
         }
+
+        public Task<AetherJsonResult> CortexOperationalStatusAsync(MlCortexOperationalStatusRequest request, CancellationToken ct = default)
+        {
+            if (request is null)
+                throw new ArgumentNullException(nameof(request));
+
+            var symbol = NormalizeSymbol(request.Symbol);
+            if (string.IsNullOrWhiteSpace(symbol))
+                return Task.FromResult(new AetherJsonResult(false, string.Empty, "Invalid symbol format.", -1, false));
+
+            var args = new List<string>
+            {
+                "--symbol", symbol,
+                "--horizon", string.IsNullOrWhiteSpace(request.ActiveHorizon) ? "1d" : request.ActiveHorizon.Trim().ToLowerInvariant(),
+                "--interval", string.IsNullOrWhiteSpace(request.Interval) ? "1h" : request.Interval.Trim().ToLowerInvariant(),
+            };
+
+            return _root.RunAsync("ml", "cortex_operational_status", args, DefaultTimeoutMs, ct);
+        }
     }
 
     private sealed class SimGateway : IAether.ISimGateway
@@ -316,6 +335,77 @@ public sealed class Aether : IAether
             };
 
             return _root.RunAsync("sim", "backtest", args, 90_000, ct);
+        }
+
+        // ─── Dream State (Simulation Mode) ──────────────────────
+
+        public Task<AetherJsonResult> DreamCreateAsync(DreamCreateRequest request, CancellationToken ct = default)
+        {
+            if (request is null) throw new ArgumentNullException(nameof(request));
+            var symbol = NormalizeSymbol(request.Symbol);
+            if (string.IsNullOrWhiteSpace(symbol))
+                return Task.FromResult(new AetherJsonResult(false, string.Empty, "Invalid symbol format.", -1, false));
+
+            var args = new List<string>
+            {
+                "--symbol", symbol,
+                "--horizon", request.Horizon ?? "1d",
+                "--interval", request.Interval ?? "1h",
+                "--start", request.ReplayStartUtc,
+                "--end", request.ReplayEndUtc,
+                "--model-key", request.ModelKey ?? "cortex_sgd_1h_24bar",
+                "--feature-version", request.FeatureVersion ?? "v2.0.0",
+            };
+            if (request.WarmStart) args.Add("--warm-start");
+
+            return _root.RunAsync("sim", "dream_create", args, 60_000, ct);
+        }
+
+        public Task<AetherJsonResult> DreamStepAsync(DreamStepRequest request, CancellationToken ct = default)
+        {
+            if (request is null) throw new ArgumentNullException(nameof(request));
+            var args = new List<string> { "--dream-id", request.DreamId };
+            if (!string.IsNullOrWhiteSpace(request.StepPayloadJson))
+            {
+                args.Add("--payload");
+                args.Add(request.StepPayloadJson);
+            }
+            return _root.RunAsync("sim", "dream_step", args, 60_000, ct);
+        }
+
+        public Task<AetherJsonResult> DreamResolveAsync(DreamResolveRequest request, CancellationToken ct = default)
+        {
+            if (request is null) throw new ArgumentNullException(nameof(request));
+            return _root.RunAsync("sim", "dream_resolve", new List<string> { "--dream-id", request.DreamId }, 120_000, ct);
+        }
+
+        public Task<AetherJsonResult> DreamTrainAsync(DreamTrainRequest request, CancellationToken ct = default)
+        {
+            if (request is null) throw new ArgumentNullException(nameof(request));
+            return _root.RunAsync("sim", "dream_train", new List<string> { "--dream-id", request.DreamId }, 120_000, ct);
+        }
+
+        public Task<AetherJsonResult> DreamEvaluateAsync(DreamEvaluateRequest request, CancellationToken ct = default)
+        {
+            if (request is null) throw new ArgumentNullException(nameof(request));
+            return _root.RunAsync("sim", "dream_evaluate", new List<string> { "--dream-id", request.DreamId }, 180_000, ct);
+        }
+
+        public Task<AetherJsonResult> DreamStatusAsync(DreamStatusRequest request, CancellationToken ct = default)
+        {
+            if (request is null) throw new ArgumentNullException(nameof(request));
+            return _root.RunAsync("sim", "dream_status", new List<string> { "--dream-id", request.DreamId }, DefaultTimeoutMs, ct);
+        }
+
+        public Task<AetherJsonResult> DreamListAsync(CancellationToken ct = default)
+        {
+            return _root.RunAsync("sim", "dream_list", new List<string>(), DefaultTimeoutMs, ct);
+        }
+
+        public Task<AetherJsonResult> DreamAbortAsync(DreamAbortRequest request, CancellationToken ct = default)
+        {
+            if (request is null) throw new ArgumentNullException(nameof(request));
+            return _root.RunAsync("sim", "dream_abort", new List<string> { "--dream-id", request.DreamId }, DefaultTimeoutMs, ct);
         }
     }
 

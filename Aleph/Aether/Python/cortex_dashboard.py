@@ -46,6 +46,7 @@ from ml.training_cursor import load_cursor
 from ml.brain_state import load_model
 from ml.scorecard import compute_rolling_scorecard, DEFAULT_SCORECARD_POLICY
 from ml.policies import get_active_policies
+from ml.operational_status import compute_operational_snapshot, format_operational_snapshot
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -282,6 +283,63 @@ def render_dashboard(
         for issue in health["issues"]:
             bang = _color("!", _YELLOW)
             lines.append("    {} {}".format(bang, issue))
+
+    # ── Operational Status ──
+    lines.append(_header("Pipeline Status"))
+    try:
+        op_snap = compute_operational_snapshot(symbol, horizon, "1h")
+        op_formatted = format_operational_snapshot(op_snap)
+
+        # Pipeline state with color
+        state = op_formatted.get("pipeline_state", "unknown")
+        state_colors = {
+            "healthy_waiting": _GREEN,
+            "healthy_idle": _GREEN,
+            "healthy_progressing": _GREEN + _BOLD,
+            "blocked_schema": _RED,
+            "blocked_data": _RED,
+            "stalled": _YELLOW + _BOLD,
+            "degraded": _YELLOW,
+            "broken": _RED + _BOLD,
+        }
+        state_color = state_colors.get(state, _DIM)
+        lines.append("  State:  {}".format(_color(state.upper().replace("_", " "), state_color)))
+
+        # Human summary
+        human = op_formatted.get("human_summary", "")
+        if human:
+            lines.append("  {}".format(_color(human, _DIM)))
+
+        # Maturity timeline
+        maturity = op_formatted.get("maturity_timeline", {})
+        mature_count = maturity.get("mature_count", 0)
+        immature_count = maturity.get("immature_count", 0)
+        if mature_count > 0 or immature_count > 0:
+            lines.append(_kv("Mature predictions", mature_count, good=mature_count > 0))
+            lines.append(_kv("Awaiting maturity", immature_count))
+            next_mat = maturity.get("next_maturity_utc")
+            if next_mat:
+                lines.append(_kv("Next maturity", next_mat))
+            avg_h = maturity.get("avg_hours_to_maturity", 0)
+            if avg_h > 0:
+                lines.append(_kv("Avg time to maturity", "{:.1f}h".format(avg_h)))
+
+        # Schema health
+        schema = op_formatted.get("schema_health", {})
+        mismatches = schema.get("mismatch_count", 0)
+        if mismatches > 0:
+            lines.append(_kv("Schema mismatches", mismatches, warn=True))
+
+        # Training readiness
+        readiness = op_formatted.get("training_readiness", {})
+        gate = readiness.get("gate_status", "unknown")
+        if gate == "ready":
+            lines.append(_kv("Training gate", "OPEN", good=True))
+        elif gate == "blocked":
+            reasons = readiness.get("block_reasons", [])
+            lines.append(_kv("Training gate", "BLOCKED: {}".format(", ".join(reasons[:3])), warn=True))
+    except Exception as ex:
+        lines.append(_kv("Status", "error: {}".format(ex), warn=True))
 
     # ── Model ──
     lines.append(_header("Model"))
@@ -522,6 +580,12 @@ def collect_all_as_json(symbol: str, horizon: str, run_eval: bool = False) -> di
         "policies": get_active_policies(),
     }
 
+    try:
+        op_snap = compute_operational_snapshot(symbol, horizon, "1h")
+        result["operational_status"] = format_operational_snapshot(op_snap)
+    except Exception:
+        pass
+
     if run_eval:
         from ml.challenger_runner import run_challenger_comparison, build_default_challengers
         from ml.promotion import DEFAULT_PROMOTION_POLICY
@@ -550,6 +614,7 @@ def main():
     parser.add_argument("--horizon", default="1d", help="Prediction horizon")
     parser.add_argument("--full", action="store_true", help="Show full detail (calibration curve, etc.)")
     parser.add_argument("--evaluate", action="store_true", help="Run challenger evaluation")
+    parser.add_argument("--dreams", action="store_true", help="Show dream state summary")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     args = parser.parse_args()
 
@@ -591,6 +656,28 @@ def main():
             print(render_evaluation_summary({"ok": True, "evaluation": eval_result}))
         else:
             print(_kv("Evaluation", "No resolved samples available", warn=True))
+
+    # Optional dream state summary
+    if args.dreams:
+        try:
+            from ml.dream_state import list_dreams
+            dreams = list_dreams()
+            if dreams:
+                print(_header("Dream States"))
+                for d in dreams:
+                    status = d.get("status", "?")
+                    dream_id = d.get("dream_id", "?")
+                    progress = d.get("progress_pct", 0)
+                    status_color = _GREEN if status == "completed" else (_YELLOW if status == "running" else _DIM)
+                    print("  {}  {}  {:.0f}%".format(
+                        _color(dream_id, _BOLD),
+                        _color(status, status_color),
+                        progress
+                    ))
+            else:
+                print(_kv("Dreams", "No dream states found", warn=False))
+        except Exception as ex:
+            print(_kv("Dreams", "error: {}".format(ex), warn=True))
 
 
 if __name__ == "__main__":

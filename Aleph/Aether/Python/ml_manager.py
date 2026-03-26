@@ -19,7 +19,7 @@ def _ok(action, symbol, extra=None):
 
 def handle_action(action, argv):
     # ── Cortex actions (Phase 8+ brain) ──
-    if action in ("cortex_predict", "cortex_train", "cortex_status", "cortex_resolve", "cortex_evaluate"):
+    if action in ("cortex_predict", "cortex_train", "cortex_status", "cortex_resolve", "cortex_evaluate", "cortex_operational_status"):
         return _handle_cortex(action, argv)
 
     # ── Legacy ML actions ──
@@ -112,6 +112,11 @@ def _handle_cortex(action, argv):
             horizon=args.horizon,
             challengers_json=args.challengers,
         )
+
+    elif action == "cortex_operational_status":
+        from ml.operational_status import compute_operational_snapshot, format_operational_snapshot
+        op = compute_operational_snapshot(symbol, args.horizon, args.interval)
+        return {"ok": True, "domain": "ml", "action": action, **format_operational_snapshot(op)}
 
     return {"ok": False, "domain": "ml", "action": action, "error": "Unknown cortex action."}
 

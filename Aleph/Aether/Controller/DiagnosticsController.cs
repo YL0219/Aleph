@@ -146,6 +146,91 @@ public sealed class DiagnosticsController : ControllerBase
         });
     }
 
+    /// <summary>
+    /// Operational status — rich pipeline health with maturity timeline, schema health,
+    /// and training readiness. Makes one Python call. Clearly distinguishes healthy waiting
+    /// from stalled/broken states.
+    /// </summary>
+    [HttpGet("operational")]
+    public async Task<IActionResult> GetOperationalStatus(
+        [FromQuery] string symbol = "BTCUSDT",
+        [FromQuery] string horizon = "1d",
+        [FromQuery] string interval = "1h",
+        CancellationToken ct = default)
+    {
+        try
+        {
+            var result = await _aether.Ml.CortexOperationalStatusAsync(new MlCortexOperationalStatusRequest
+            {
+                Symbol = symbol,
+                ActiveHorizon = horizon,
+                Interval = interval,
+            }, ct);
+
+            if (!result.Success)
+                return Ok(new { status = "error", error = result.Error, timedOut = result.TimedOut });
+
+            return Content(result.PayloadJson, "application/json");
+        }
+        catch (OperationCanceledException)
+        {
+            return StatusCode(499, new { status = "cancelled" });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[Diagnostics] Operational status query failed.");
+            return StatusCode(500, new { status = "error", error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Dream state list — returns all simulation dreams with their status.
+    /// </summary>
+    [HttpGet("dreams")]
+    public async Task<IActionResult> GetDreamList(CancellationToken ct = default)
+    {
+        try
+        {
+            var result = await _aether.Sim.DreamListAsync(ct);
+            if (!result.Success)
+                return Ok(new { status = "error", error = result.Error });
+            return Content(result.PayloadJson, "application/json");
+        }
+        catch (OperationCanceledException)
+        {
+            return StatusCode(499, new { status = "cancelled" });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[Diagnostics] Dream list query failed.");
+            return StatusCode(500, new { status = "error", error = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Dream state status — returns detailed status for a specific dream.
+    /// </summary>
+    [HttpGet("dreams/{dreamId}")]
+    public async Task<IActionResult> GetDreamStatus(string dreamId, CancellationToken ct = default)
+    {
+        try
+        {
+            var result = await _aether.Sim.DreamStatusAsync(new DreamStatusRequest { DreamId = dreamId }, ct);
+            if (!result.Success)
+                return Ok(new { status = "error", error = result.Error });
+            return Content(result.PayloadJson, "application/json");
+        }
+        catch (OperationCanceledException)
+        {
+            return StatusCode(499, new { status = "cancelled" });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[Diagnostics] Dream status query failed for {DreamId}.", dreamId);
+            return StatusCode(500, new { status = "error", error = ex.Message });
+        }
+    }
+
     private static string DetermineHealth(HomeostasisSnapshot snapshot)
     {
         if (snapshot.OverloadLevel >= 0.7 || snapshot.FailureStreak >= 3)

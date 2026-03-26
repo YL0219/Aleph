@@ -51,6 +51,8 @@ from .prediction_formatter import (
 from .scorecard import compute_scorecard, compute_rolling_scorecard, DEFAULT_SCORECARD_POLICY
 from .challenger_runner import run_challenger_comparison, build_default_challengers, ChallengerSpec
 from .promotion import DEFAULT_PROMOTION_POLICY
+from .schema_gate import filter_compatible_memories, check_memory_compatibility
+from .model_registry import ModelRoster
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -162,6 +164,21 @@ def cortex_predict(symbol: str, interval: str, horizon: str, asof_utc: str, payl
 
     # ── Generate prediction ID ──
     prediction_id = uuid.uuid4().hex[:16]
+
+    # ── Touch model registry (best-effort) ──
+    try:
+        roster = ModelRoster.load()
+        if not roster.get_model(model_key) and model_key:
+            from .model_registry import ModelIdentity
+            roster.register_model(ModelIdentity(
+                model_key=model_key,
+                feature_version=feature_version,
+                label_policy_version=DEFAULT_LABEL_POLICY.version,
+                description=f"Auto-registered from predict for {symbol}/{horizon}",
+            ))
+            roster.save()
+    except Exception:
+        pass  # non-blocking
 
     # ── Get entry price ──
     technical = payload.get("technical", {})
@@ -360,6 +377,28 @@ def cortex_train(symbol: str, horizon: str, max_samples: int = 200) -> dict:
         max_samples=max_samples * 3,  # load more for replay pool
     )
 
+    # ── Schema compatibility gate ──
+    if fresh:
+        compatible, incompatible, adapted = filter_compatible_memories(
+            fresh, FEATURE_VERSION
+        )
+        if incompatible:
+            warnings.append(f"schema_filtered:{len(incompatible)}_incompatible_memories")
+            print(
+                f"[MlCortex] Schema gate: {len(compatible)} compatible, "
+                f"{len(adapted)} adapted, {len(incompatible)} incompatible",
+                file=sys.stderr,
+            )
+        fresh = compatible + adapted
+
+    if replay_pool:
+        replay_compat, replay_incompat, replay_adapted = filter_compatible_memories(
+            replay_pool, FEATURE_VERSION
+        )
+        if replay_incompat:
+            warnings.append(f"schema_filtered_replay:{len(replay_incompat)}_incompatible")
+        replay_pool = replay_compat + replay_adapted
+
     if not fresh:
         print(f"[MlCortex] No fresh resolved samples for {symbol}/{horizon}", file=sys.stderr)
         return format_controlled_train(
@@ -457,7 +496,16 @@ def cortex_status(symbol: str, horizon: str) -> dict:
         except Exception as ex:
             print(f"[MlCortex] Rolling scorecard error: {ex}", file=sys.stderr)
 
-    return format_status(
+    # ── Operational status assessment ──
+    operational = None
+    try:
+        from .operational_status import compute_operational_snapshot, format_operational_snapshot
+        op_snap = compute_operational_snapshot(symbol, horizon, "1h")
+        operational = format_operational_snapshot(op_snap)
+    except Exception as ex:
+        print(f"[MlCortex] Operational status error: {ex}", file=sys.stderr)
+
+    result = format_status(
         symbol=symbol,
         horizon=horizon,
         model_state=model.model_state,
@@ -477,6 +525,9 @@ def cortex_status(symbol: str, horizon: str) -> dict:
         active_policies=get_active_policies(),
         rolling_scorecard=rolling_sc,
     )
+    if operational is not None:
+        result["operational_status"] = operational
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════
