@@ -20,7 +20,7 @@ namespace Aleph
         [McpServerTool(Name = "aether_get_status", ReadOnly = true)]
         [Description("Get Aether ML engine status as JSON. Optional symbol narrows the status scope.")]
         public async Task<string> AetherGetStatus(
-            [Description("Optional stock ticker symbol, e.g. AMD.")]
+            [Description("Optional market symbol, e.g. SI=F or AAPL.")]
             string symbol = "",
             CancellationToken ct = default)
         {
@@ -31,7 +31,7 @@ namespace Aleph
         [McpServerTool(Name = "aether_math_run", ReadOnly = true)]
         [Description("Run Aether quantitative indicator evaluation for a symbol.")]
         public async Task<string> AetherMathRun(
-            [Description("Stock ticker symbol.")]
+            [Description("Market symbol (e.g. SI=F, GC=F, AAPL).")]
             string symbol,
             [Description("Historical window in days. Default is 30.")]
             int days = 30,
@@ -45,7 +45,7 @@ namespace Aleph
         [McpServerTool(Name = "aether_ml_predict", ReadOnly = true)]
         [Description("Run Aether ML prediction placeholder for a symbol.")]
         public async Task<string> AetherMlPredict(
-            [Description("Stock ticker symbol.")]
+            [Description("Market symbol (e.g. SI=F, GC=F, AAPL).")]
             string symbol,
             [Description("Prediction horizon in days. Default is 5.")]
             int horizon_days = 5,
@@ -59,7 +59,7 @@ namespace Aleph
         [McpServerTool(Name = "aether_ml_train", ReadOnly = false)]
         [Description("Trigger Aether ML training placeholder for a symbol.")]
         public async Task<string> AetherMlTrain(
-            [Description("Stock ticker symbol.")]
+            [Description("Market symbol (e.g. SI=F, GC=F, AAPL).")]
             string symbol,
             [Description("Epoch count. Default is 1.")]
             int epochs = 1,
@@ -73,7 +73,7 @@ namespace Aleph
         [McpServerTool(Name = "aether_sim_run", ReadOnly = true)]
         [Description("Run Aether simulation/backtest placeholder for a symbol.")]
         public async Task<string> AetherSimRun(
-            [Description("Stock ticker symbol.")]
+            [Description("Market symbol (e.g. SI=F, GC=F, AAPL).")]
             string symbol,
             [Description("Backtest window in days. Default is 180.")]
             int days = 180,
@@ -167,3 +167,4 @@ namespace Aleph
         }
     }
 }
+

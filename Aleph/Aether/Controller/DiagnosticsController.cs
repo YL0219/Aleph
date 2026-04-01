@@ -17,15 +17,18 @@ public sealed class DiagnosticsController : ControllerBase
     private readonly IHomeostasis _homeostasis;
     private readonly IAether _aether;
     private readonly ILogger<DiagnosticsController> _logger;
+    private readonly string _defaultCortexSymbol;
 
     public DiagnosticsController(
         IHomeostasis homeostasis,
         IAether aether,
+        IConfiguration configuration,
         ILogger<DiagnosticsController> logger)
     {
         _homeostasis = homeostasis;
         _aether = aether;
         _logger = logger;
+        _defaultCortexSymbol = ResolveDefaultCortexSymbol(configuration);
     }
 
     /// <summary>
@@ -62,15 +65,17 @@ public sealed class DiagnosticsController : ControllerBase
     /// </summary>
     [HttpGet("cortex")]
     public async Task<IActionResult> GetCortexStatus(
-        [FromQuery] string symbol = "BTCUSDT",
+        [FromQuery] string? symbol = null,
         [FromQuery] string horizon = "1d",
         CancellationToken ct = default)
     {
+        var normalizedSymbol = ResolveSymbolOrDefault(symbol);
+
         try
         {
             var result = await _aether.Ml.CortexStatusAsync(new MlCortexStatusRequest
             {
-                Symbol = symbol,
+                Symbol = normalizedSymbol,
                 ActiveHorizon = horizon,
             }, ct);
 
@@ -104,10 +109,11 @@ public sealed class DiagnosticsController : ControllerBase
     /// </summary>
     [HttpGet("snapshot")]
     public async Task<IActionResult> GetSnapshot(
-        [FromQuery] string symbol = "BTCUSDT",
+        [FromQuery] string? symbol = null,
         [FromQuery] string horizon = "1d",
         CancellationToken ct = default)
     {
+        var normalizedSymbol = ResolveSymbolOrDefault(symbol);
         var snapshot = _homeostasis.GetSnapshot();
         var health = DetermineHealth(snapshot);
 
@@ -116,7 +122,7 @@ public sealed class DiagnosticsController : ControllerBase
         {
             var result = await _aether.Ml.CortexStatusAsync(new MlCortexStatusRequest
             {
-                Symbol = symbol,
+                Symbol = normalizedSymbol,
                 ActiveHorizon = horizon,
             }, ct);
 
@@ -153,16 +159,18 @@ public sealed class DiagnosticsController : ControllerBase
     /// </summary>
     [HttpGet("operational")]
     public async Task<IActionResult> GetOperationalStatus(
-        [FromQuery] string symbol = "BTCUSDT",
+        [FromQuery] string? symbol = null,
         [FromQuery] string horizon = "1d",
         [FromQuery] string interval = "1h",
         CancellationToken ct = default)
     {
+        var normalizedSymbol = ResolveSymbolOrDefault(symbol);
+
         try
         {
             var result = await _aether.Ml.CortexOperationalStatusAsync(new MlCortexOperationalStatusRequest
             {
-                Symbol = symbol,
+                Symbol = normalizedSymbol,
                 ActiveHorizon = horizon,
                 Interval = interval,
             }, ct);
@@ -240,5 +248,20 @@ public sealed class DiagnosticsController : ControllerBase
         if (snapshot.StressLevel >= 0.6 || snapshot.FatigueLevel >= 0.5 || snapshot.OverloadLevel >= 0.4)
             return "degraded";
         return "healthy";
+    }
+
+    private static string ResolveDefaultCortexSymbol(IConfiguration configuration)
+    {
+        var configured = configuration["Aether:SleepCycle:Symbol"];
+        return SymbolValidator.TryNormalize(configured, out var normalized)
+            ? normalized
+            : "SI=F";
+    }
+
+    private string ResolveSymbolOrDefault(string? symbol)
+    {
+        return SymbolValidator.TryNormalize(symbol, out var normalized)
+            ? normalized
+            : _defaultCortexSymbol;
     }
 }

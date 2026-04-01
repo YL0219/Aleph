@@ -40,6 +40,7 @@ def resolve_pending_batch(
     ohlcv_df: pd.DataFrame | None,
     label_policy: LabelPolicy | None = None,
     resolution_policy: ResolutionPolicy | None = None,
+    data_interval: str | None = None,
 ) -> ResolutionResult:
     """
     Attempt to resolve a batch of pending predictions against market truth.
@@ -50,6 +51,9 @@ def resolve_pending_batch(
                           sorted by time ascending, with timezone-aware datetime index
       label_policy      — labeling rules; defaults to DEFAULT_LABEL_POLICY
       resolution_policy — resolution rules; defaults to DEFAULT_RESOLUTION_POLICY
+      data_interval     — actual interval of the loaded OHLCV data (e.g. "1d" even
+                          when the sample's interval is "1h"). When the data is coarser
+                          than the sample interval, tolerances and coverage are adjusted.
 
     Returns:
       ResolutionResult with resolved, deferred, expired, and errored samples plus stats.
@@ -92,7 +96,7 @@ def resolve_pending_batch(
     # ── Process each pending sample ──
     for sample in pending_samples:
         try:
-            outcome = _resolve_single(sample, df, lp, rp, now_utc)
+            outcome = _resolve_single(sample, df, lp, rp, now_utc, data_interval=data_interval)
         except Exception as ex:
             errored.append({**sample, "_error": str(ex)})
             continue
@@ -125,6 +129,7 @@ def _resolve_single(
     lp: LabelPolicy,
     rp: ResolutionPolicy,
     now_utc: datetime,
+    data_interval: str | None = None,
 ) -> dict:
     """
     Attempt to resolve one pending sample.
@@ -161,11 +166,24 @@ def _resolve_single(
     if bar_duration is None:
         return {"status": "error", "reason": f"unsupported_interval:{interval}"}
 
-    target_bar_dt = asof_dt + (bar_duration * horizon_bars)
+    # Total horizon duration in real time (e.g. 24 × 1h = 24h)
+    horizon_duration = bar_duration * horizon_bars
+    target_bar_dt = asof_dt + horizon_duration
+
+    # ── Determine effective data bar duration ──
+    # When the loaded OHLCV data is coarser than the sample interval
+    # (e.g. daily bars for hourly predictions), use the data interval
+    # for tolerance and coverage calculations.
+    effective_interval = data_interval or interval
+    data_bar_duration = _interval_to_timedelta(effective_interval) or bar_duration
 
     # ── Find anchor and target bars in OHLCV ──
-    anchor_idx = _find_nearest_bar(df, asof_dt, tolerance=bar_duration)
-    target_idx = _find_nearest_bar(df, target_bar_dt, tolerance=bar_duration)
+    # Use floor-based (backward-looking) matching: find the latest bar
+    # whose timestamp is ≤ the target.  This correctly maps exact
+    # heartbeat timestamps (e.g. 21:48:12) to their enclosing bar
+    # (e.g. the daily bar at 00:00:00 for that day).
+    anchor_idx = _find_floor_bar(df, asof_dt, tolerance=data_bar_duration)
+    target_idx = _find_floor_bar(df, target_bar_dt, tolerance=data_bar_duration)
 
     if anchor_idx is None:
         return {"status": "deferred", "reason": "anchor_bar_not_found"}
@@ -181,8 +199,14 @@ def _resolve_single(
         return {"status": "error", "reason": "target_not_after_anchor"}
 
     # ── Check horizon coverage ──
-    bars_available = target_idx - anchor_idx
-    coverage = bars_available / max(horizon_bars, 1)
+    # Coverage is measured in *time* rather than bar count, so that
+    # coarser data (e.g. 1 daily bar spanning 24h) correctly counts
+    # as full coverage for a 24h horizon.
+    anchor_time = df.iloc[anchor_idx]["time"]
+    target_time = df.iloc[target_idx]["time"]
+    time_covered = (target_time - anchor_time).total_seconds()
+    horizon_seconds = horizon_duration.total_seconds()
+    coverage = time_covered / max(horizon_seconds, 1.0)
     if coverage < rp.min_horizon_coverage:
         return {"status": "deferred", "reason": f"insufficient_coverage:{coverage:.2f}"}
 
@@ -293,7 +317,7 @@ def _resolve_single(
         "actual_label": label,
         "move_strength": move_strength,
         "ambiguity_score": round(ambiguity, 4),
-        "horizon_bars_used": bars_available,
+        "horizon_bars_used": target_idx - anchor_idx,
         "realized_range_bps": round(realized_range_bps, 2) if realized_range_bps is not None else None,
 
         # D. Grading sidecars
@@ -377,14 +401,20 @@ def _check_data_gaps(df: pd.DataFrame, rp: ResolutionPolicy) -> list[str]:
     return issues
 
 
-def _find_nearest_bar(
+def _find_floor_bar(
     df: pd.DataFrame,
     target_dt: datetime,
     tolerance: timedelta | None = None,
 ) -> int | None:
     """
-    Find the index of the bar nearest to target_dt.
-    Returns None if no bar is within tolerance.
+    Find the index of the latest bar whose timestamp is ≤ target_dt
+    (backward-looking / floor match).
+
+    This correctly maps exact prediction timestamps (e.g. 21:48:12 UTC)
+    to their enclosing bar — for example, the daily bar at 00:00:00 for
+    that same day, or the hourly bar at 21:00:00.
+
+    Returns None if no bar is at or before target_dt within tolerance.
     """
     if df.empty:
         return None
@@ -393,7 +423,47 @@ def _find_nearest_bar(
     if target_ts.tz is None:
         target_ts = target_ts.tz_localize("UTC")
 
-    # Find nearest by absolute time difference
+    # Find all bars at or before the target timestamp
+    mask = df["time"] <= target_ts
+    if not mask.any():
+        # No bar at or before target — check if the first bar is
+        # within tolerance (data might start slightly after target)
+        if tolerance is not None:
+            first_diff = (df["time"].iloc[0] - target_ts)
+            if first_diff <= tolerance:
+                return 0
+        return None
+
+    # Latest bar ≤ target
+    floor_idx = int(mask[::-1].idxmax())
+
+    # Verify within tolerance if specified
+    if tolerance is not None:
+        gap = target_ts - df.iloc[floor_idx]["time"]
+        if gap > tolerance:
+            return None
+
+    return floor_idx
+
+
+def _find_nearest_bar(
+    df: pd.DataFrame,
+    target_dt: datetime,
+    tolerance: timedelta | None = None,
+) -> int | None:
+    """
+    Find the index of the bar nearest to target_dt.
+    Returns None if no bar is within tolerance.
+
+    Kept for backward compatibility — new resolution code uses _find_floor_bar.
+    """
+    if df.empty:
+        return None
+
+    target_ts = pd.Timestamp(target_dt)
+    if target_ts.tz is None:
+        target_ts = target_ts.tz_localize("UTC")
+
     time_diffs = (df["time"] - target_ts).abs()
     nearest_idx = int(time_diffs.idxmin())
 

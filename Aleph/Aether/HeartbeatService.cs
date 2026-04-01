@@ -17,6 +17,7 @@ public sealed class HeartbeatService : BackgroundService
     private readonly IHomeostasis _homeostasis;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<HeartbeatService> _logger;
+    private readonly string _slowCycleTrainSymbol;
 
     // Base cadences (before governor adjustment)
     private readonly double _baseFastDelaySeconds;
@@ -44,6 +45,7 @@ public sealed class HeartbeatService : BackgroundService
 
         _baseFastDelaySeconds = ReadInt(configuration, "Aether:Heartbeat:FastDelaySeconds", 30, 5, 3600);
         _baseSlowDelaySeconds = ReadInt(configuration, "Aether:Heartbeat:SlowDelayMinutes", 10, 1, 720) * 60.0;
+        _slowCycleTrainSymbol = ReadSymbol(configuration, "Aether:SleepCycle:Symbol", "SI=F");
 
         _marketWindowStartUtc = TimeSpan.FromHours(ReadInt(configuration, "Aether:Heartbeat:MarketWindowStartUtcHour", 13, 0, 23));
         _marketWindowEndUtc = TimeSpan.FromHours(ReadInt(configuration, "Aether:Heartbeat:MarketWindowEndUtcHour", 20, 0, 23));
@@ -218,8 +220,10 @@ public sealed class HeartbeatService : BackgroundService
             }
             else
             {
-                await _aether.Ml.TrainAsync(new MlTrainRequest("SPY", 1), ct);
-                _logger.LogInformation("[Heartbeat] Slow cycle Aether work completed.");
+                await _aether.Ml.TrainAsync(new MlTrainRequest(_slowCycleTrainSymbol, 1), ct);
+                _logger.LogInformation(
+                    "[Heartbeat] Slow cycle Aether work completed (train symbol={Symbol}).",
+                    _slowCycleTrainSymbol);
             }
         }
     }
@@ -251,6 +255,17 @@ public sealed class HeartbeatService : BackgroundService
             return fallback;
 
         return Math.Clamp(parsed, min, max);
+    }
+
+    private static string ReadSymbol(IConfiguration configuration, string key, string fallback)
+    {
+        var configured = configuration[key];
+        if (SymbolValidator.TryNormalize(configured, out var normalized))
+            return normalized;
+
+        return SymbolValidator.TryNormalize(fallback, out var fallbackNormalized)
+            ? fallbackNormalized
+            : "SI=F";
     }
 }
 

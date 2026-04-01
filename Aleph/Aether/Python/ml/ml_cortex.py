@@ -284,7 +284,7 @@ def cortex_resolve(symbol: str, horizon: str, interval: str = "1h") -> dict:
     print(f"[MlCortex] Resolve {symbol}/{horizon} — {len(pending)} pending samples", file=sys.stderr)
 
     # ── Load OHLCV truth from parquet ──
-    ohlcv_df = _load_ohlcv_truth(symbol, interval, warnings)
+    ohlcv_df, actual_interval = _load_ohlcv_truth(symbol, interval, warnings)
 
     # ── Run resolution ──
     result = resolve_pending_batch(
@@ -292,6 +292,7 @@ def cortex_resolve(symbol: str, horizon: str, interval: str = "1h") -> dict:
         ohlcv_df=ohlcv_df,
         label_policy=DEFAULT_LABEL_POLICY,
         resolution_policy=DEFAULT_RESOLUTION_POLICY,
+        data_interval=actual_interval,
     )
 
     summary = result.summary()
@@ -631,29 +632,47 @@ def cortex_evaluate(symbol: str, horizon: str, challengers_json: str = "") -> di
 # OHLCV TRUTH LOADER
 # ═══════════════════════════════════════════════════════════════════
 
-def _load_ohlcv_truth(symbol: str, interval: str, warnings: list[str]):
+def _load_ohlcv_truth(symbol: str, interval: str, warnings: list[str]) -> tuple:
     """
     Load OHLCV data from the parquet data lake.
     Uses the quant/parquet_loader module.
+
+    Returns (DataFrame | None, actual_interval_str).
+    Falls back from finer intervals (e.g. 1h) to 1d if the requested
+    interval's parquet file does not exist.
     """
     try:
-        # Import parquet_loader from the quant sibling package
         parent = Path(__file__).resolve().parent.parent
         quant_path = str(parent / "quant")
         if quant_path not in sys.path:
             sys.path.insert(0, str(parent))
 
         from quant.parquet_loader import load_ohlcv
+
+        # Try requested interval first
         df, load_warnings = load_ohlcv(symbol, timeframe=interval, days=0)
-        if load_warnings:
-            warnings.extend(load_warnings)
-        return df
+        if df is not None:
+            if load_warnings:
+                warnings.extend(load_warnings)
+            return df, interval
+
+        # Fall back to daily if the requested interval is finer
+        if interval != "1d":
+            warnings.append(f"no_{interval}_data_falling_back_to_1d")
+            print(f"[MlCortex] No {interval} parquet for {symbol}, falling back to 1d", file=sys.stderr)
+            df, load_warnings = load_ohlcv(symbol, timeframe="1d", days=0)
+            if load_warnings:
+                warnings.extend(load_warnings)
+            if df is not None:
+                return df, "1d"
+
+        return None, interval
     except ImportError as ex:
         warnings.append(f"parquet_loader_import_error:{ex}")
-        return None
+        return None, interval
     except Exception as ex:
         warnings.append(f"ohlcv_load_error:{ex}")
-        return None
+        return None, interval
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -71,7 +71,7 @@ public sealed class SleepCycleService : BackgroundService
         _maxStressForTraining = ReadDouble(configuration, "Aether:SleepCycle:MaxStressForTraining", 0.7, 0, 1);
         _maxFatigueForTraining = ReadDouble(configuration, "Aether:SleepCycle:MaxFatigueForTraining", 0.7, 0, 1);
         _starvationHours = ReadDouble(configuration, "Aether:SleepCycle:StarvationHours", 24, 1, 168);
-        _activeSymbol = configuration["Aether:SleepCycle:Symbol"] ?? "BTCUSDT";
+        _activeSymbol = configuration["Aether:SleepCycle:Symbol"] ?? "SI=F";
         _activeHorizon = configuration["Aether:SleepCycle:Horizon"] ?? "1d";
         _activeInterval = configuration["Aether:SleepCycle:Interval"] ?? "1h";
         _evaluateEveryCycles = ReadInt(configuration, "Aether:SleepCycle:EvaluateEveryCycles", 10, 1, 100);

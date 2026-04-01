@@ -41,7 +41,7 @@ namespace Aleph
             "If symbol is provided, focuses on that ticker. " +
             "Returns JSON with provider, normalized headline items, and optional error.")]
         public async Task<string> GetNewsHeadlines(
-            [Description("Optional stock ticker symbol (e.g. AMD). Empty means macro/general headlines.")]
+            [Description("Optional market symbol (e.g. SI=F, AAPL). Empty means macro/general headlines.")]
             string symbol = "",
             [Description("Maximum headlines to return (1-30). Defaults to 10.")]
             int limit = HeadlinesDefaultLimit,
@@ -292,3 +292,4 @@ namespace Aleph
         }
     }
 }
+

@@ -11,9 +11,9 @@ A single command that renders the full operational picture:
   - Organism health assessment
 
 Usage:
-  python cortex_dashboard.py --symbol BTCUSDT --horizon 1d
-  python cortex_dashboard.py --symbol BTCUSDT --horizon 1d --full
-  python cortex_dashboard.py --symbol BTCUSDT --horizon 1d --evaluate
+  python cortex_dashboard.py --symbol SI=F --horizon 1d
+  python cortex_dashboard.py --symbol SI=F --horizon 1d --full
+  python cortex_dashboard.py --symbol SI=F --horizon 1d --evaluate
 
 Flags:
   --full       Show calibration curve and full scorecard detail
@@ -610,7 +610,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Aleph Cortex Dashboard \u2014 operational diagnostics CLI",
     )
-    parser.add_argument("--symbol", default="BTCUSDT", help="Trading symbol")
+    parser.add_argument("--symbol", default="SI=F", help="Trading symbol")
     parser.add_argument("--horizon", default="1d", help="Prediction horizon")
     parser.add_argument("--full", action="store_true", help="Show full detail (calibration curve, etc.)")
     parser.add_argument("--evaluate", action="store_true", help="Run challenger evaluation")

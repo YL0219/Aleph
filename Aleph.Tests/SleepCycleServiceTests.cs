@@ -203,7 +203,7 @@ public class SleepCycleServiceTests
         await env.RunOneCycleAsync();
 
         var evt = env.LastPublishedEvent!;
-        Assert.Equal("BTCUSDT", evt.Symbol);
+        Assert.Equal("SI=F", evt.Symbol);
         Assert.Equal("1d", evt.Horizon);
         Assert.Equal("SleepCycle", evt.Source);
         Assert.Equal("sleep_cycle_summary", evt.Kind);
@@ -660,7 +660,7 @@ public class SleepCycleServiceTests
                     ["Aether:SleepCycle:MinResolvedToTrain"] = "3",
                     ["Aether:SleepCycle:MaxStressForTraining"] = "0.7",
                     ["Aether:SleepCycle:MaxFatigueForTraining"] = "0.7",
-                    ["Aether:SleepCycle:Symbol"] = "BTCUSDT",
+                    ["Aether:SleepCycle:Symbol"] = "SI=F",
                     ["Aether:SleepCycle:Horizon"] = "1d",
                     ["Aether:SleepCycle:Interval"] = "1h",
                     ["Aether:SleepCycle:EvaluateEveryCycles"] = evaluateEveryCycles.ToString(),
@@ -796,6 +796,13 @@ public class SleepCycleServiceTests
             {
                 EvaluateCalled = true;
                 return Task.FromResult(new AetherJsonResult(EvaluateSuccess, EvaluateJson, null, 0, false));
+            }
+
+            public Task<AetherJsonResult> CortexOperationalStatusAsync(
+                MlCortexOperationalStatusRequest request,
+                CancellationToken ct)
+            {
+                return Task.FromResult(new AetherJsonResult(true, "{}", null, 0, false));
             }
 
             public Task<AetherJsonResult> CortexPredictAsync(MlCortexPredictRequest request, CancellationToken ct) =>

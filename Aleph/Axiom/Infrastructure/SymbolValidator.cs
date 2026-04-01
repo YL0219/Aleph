@@ -1,6 +1,7 @@
 // CONTRACT / INVARIANTS
-// - Valid symbols: 1-15 characters, uppercase A-Z, digits 0-9, dots, hyphens.
-//   Covers standard tickers (AAPL), class shares (BRK.B), and hyphenated (BF-B).
+// - Valid symbols: 1-15 characters, uppercase A-Z, digits 0-9, dots, hyphens, equals.
+//   Covers standard tickers (AAPL), class shares (BRK.B), hyphenated (BF-B),
+//   and futures notation (SI=F).
 // - Normalize() always returns UPPERCASE.
 // - Must be used everywhere symbols enter Python args, external API calls, or cache keys.
 // - Stateless, thread-safe, no allocations beyond the normalized string.
@@ -16,7 +17,7 @@ namespace Aleph
     public static class SymbolValidator
     {
         private static readonly Regex ValidPattern =
-            new(@"^[A-Z0-9.\-]{1,15}$", RegexOptions.Compiled);
+            new(@"^[A-Z0-9.\-=]{1,15}$", RegexOptions.Compiled);
 
         /// <summary>Checks if the symbol is valid (after uppercasing).</summary>
         public static bool IsValid(string? symbol)

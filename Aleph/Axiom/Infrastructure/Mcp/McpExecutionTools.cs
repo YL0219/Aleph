@@ -39,7 +39,7 @@ namespace Aleph
         public async Task<string> ExecuteTrade(
             [Description("Trade action. Must be 'buy' or 'sell'.")]
             string action,
-            [Description("Stock ticker symbol, e.g., AAPL.")]
+            [Description("Market symbol, e.g., SI=F or AAPL.")]
             string symbol,
             [Description("Number of shares to trade (must be greater than 0).")]
             int shares,
@@ -54,7 +54,7 @@ namespace Aleph
         [McpServerTool(Name = "open_chart", ReadOnly = true)]
         [Description("Opens an interactive candlestick chart for a symbol.")]
         public Task<string> OpenChart(
-            [Description("Stock ticker symbol, e.g., AAPL.")]
+            [Description("Market symbol, e.g., SI=F or AAPL.")]
             string symbol,
             [Description("Timeframe: 1m, 5m, 15m, 1h, 1d, 1w, or 1mo. Defaults to 1d.")]
             string tf = "1d",
@@ -153,3 +153,4 @@ namespace Aleph
         }
     }
 }
+

@@ -7,7 +7,7 @@ public sealed class Aether : IAether
     private const int DefaultTimeoutMs = 30_000;
 
     private static readonly Regex SymbolPattern =
-        new("^[A-Z0-9][A-Z0-9.-]{0,14}$", RegexOptions.Compiled);
+        new("^[A-Z0-9][A-Z0-9.=\\-]{0,14}$", RegexOptions.Compiled);
 
     private readonly IAxiom _axiom;
     private readonly IStressInjector _stressInjector;

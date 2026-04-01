@@ -34,12 +34,12 @@ namespace Aleph
         }
 
 
-        // GET /api/market/quote?symbol=AMD
+        // GET /api/market/quote?symbol=SI=F
         [HttpGet("quote")]
         public async Task<IActionResult> GetQuote([FromQuery] string symbol, CancellationToken ct)
         {
             if (!SymbolValidator.TryNormalize(symbol, out var normalized))
-                return BadRequest(new { error = "Invalid symbol. Must be 1-15 alphanumeric characters (A-Z, 0-9, dot, hyphen)." });
+                return BadRequest(new { error = "Invalid symbol. Must be 1-15 uppercase market-symbol characters (A-Z, 0-9, dot, hyphen, equals)." });
 
             _logger.LogInformation("[Market] Quote request for {Symbol}", normalized);
 
@@ -63,7 +63,7 @@ namespace Aleph
         }
 
 
-        // GET /api/market/candles?symbol=AMD&tf=1d&range=180d&limit=500&to=optional
+        // GET /api/market/candles?symbol=SI=F&tf=1d&range=180d&limit=500&to=optional
         [HttpGet("candles")]
         public async Task<IActionResult> GetCandles(
             [FromQuery] string symbol,

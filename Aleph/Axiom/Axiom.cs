@@ -23,6 +23,9 @@ public sealed class Axiom : IAxiom
     private readonly IAlephBus _bus;
     private readonly IHostEnvironment _env;
     private readonly ILogger<Axiom> _logger;
+    private readonly IReadOnlyList<string> _configuredIngestionUniverseSymbols;
+    private readonly IReadOnlyList<string> _invalidConfiguredIngestionUniverseSymbols;
+    private readonly bool _includeDatabaseSymbolsForIngestion;
 
     public IAxiom.IPythonRouter Python { get; }
     public IAxiom.IMarketGateway Market { get; }
@@ -44,6 +47,7 @@ public sealed class Axiom : IAxiom
         ISkillRegistry skillRegistry,
         IAlephBus bus,
         IHostEnvironment env,
+        IConfiguration configuration,
         ILogger<Axiom> logger)
     {
         _dbFactory = dbFactory;
@@ -56,6 +60,27 @@ public sealed class Axiom : IAxiom
         _bus = bus;
         _env = env;
         _logger = logger;
+        (_configuredIngestionUniverseSymbols, _invalidConfiguredIngestionUniverseSymbols) =
+            ParseConfiguredIngestionUniverse(configuration);
+        _includeDatabaseSymbolsForIngestion =
+            bool.TryParse(configuration["Axiom:Ingestion:IncludeDatabaseSymbols"], out var includeDb)
+            && includeDb;
+
+        if (_invalidConfiguredIngestionUniverseSymbols.Count > 0)
+        {
+            _logger.LogWarning(
+                "[Ingestion] Invalid configured symbols in Axiom:Ingestion:UniverseSymbols were ignored: {Symbols}",
+                string.Join(", ", _invalidConfiguredIngestionUniverseSymbols));
+        }
+
+        if (_configuredIngestionUniverseSymbols.Count > 0)
+        {
+            _logger.LogInformation(
+                "[Ingestion] Configured universe loaded ({Count}) with IncludeDatabaseSymbols={IncludeDb}: {Symbols}",
+                _configuredIngestionUniverseSymbols.Count,
+                _includeDatabaseSymbolsForIngestion,
+                string.Join(", ", _configuredIngestionUniverseSymbols));
+        }
 
         Python = new PythonRouterGateway(this);
         Market = new MarketGateway(this);
@@ -66,6 +91,53 @@ public sealed class Axiom : IAxiom
         ToolRuns = new ToolRunGateway(this);
         Skills = new SkillGateway(this);
         Perception = new PerceptionGateway(this);
+    }
+
+    private static (IReadOnlyList<string> Valid, IReadOnlyList<string> Invalid) ParseConfiguredIngestionUniverse(
+        IConfiguration configuration)
+    {
+        var section = configuration.GetSection("Axiom:Ingestion:UniverseSymbols");
+        var rawSymbols = new List<string>();
+        foreach (var child in section.GetChildren())
+        {
+            if (!string.IsNullOrWhiteSpace(child.Value))
+                rawSymbols.Add(child.Value);
+        }
+
+        var csv = configuration["Axiom:Ingestion:UniverseSymbols"];
+        if (!string.IsNullOrWhiteSpace(csv))
+        {
+            rawSymbols.AddRange(
+                csv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        }
+
+        var valid = new List<string>();
+        var invalid = new List<string>();
+        foreach (var raw in rawSymbols)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                continue;
+
+            if (SymbolValidator.TryNormalize(raw, out var normalized))
+            {
+                valid.Add(normalized);
+            }
+            else
+            {
+                invalid.Add(raw.Trim());
+            }
+        }
+
+        return (
+            valid
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(s => s)
+                .ToList(),
+            invalid
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(s => s)
+                .ToList()
+        );
     }
 
     private sealed class PythonRouterGateway : IAxiom.IPythonRouter
@@ -634,6 +706,43 @@ public sealed class Axiom : IAxiom
         public bool IsPythonAvailable => _root._pythonDispatcher.IsAvailable;
 
         public async Task<IReadOnlyList<string>> GetActiveSymbolsAsync(CancellationToken ct = default)
+        {
+            if (_root._configuredIngestionUniverseSymbols.Count > 0)
+            {
+                if (_root._includeDatabaseSymbolsForIngestion)
+                {
+                    var databaseSymbols = await GetDatabaseActiveSymbolsAsync(ct);
+                    var merged = _root._configuredIngestionUniverseSymbols
+                        .Concat(databaseSymbols)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .OrderBy(s => s)
+                        .ToList();
+
+                    _root._logger.LogInformation(
+                        "[Ingestion] Active symbols resolved from configuration + database. Configured={ConfiguredCount}, Database={DatabaseCount}, Final={FinalCount}.",
+                        _root._configuredIngestionUniverseSymbols.Count,
+                        databaseSymbols.Count,
+                        merged.Count);
+
+                    return merged;
+                }
+
+                _root._logger.LogInformation(
+                    "[Ingestion] Active symbols resolved from configuration override ({Count}): {Symbols}",
+                    _root._configuredIngestionUniverseSymbols.Count,
+                    string.Join(", ", _root._configuredIngestionUniverseSymbols));
+                return _root._configuredIngestionUniverseSymbols;
+            }
+
+            var fallbackSymbols = await GetDatabaseActiveSymbolsAsync(ct);
+            _root._logger.LogInformation(
+                "[Ingestion] Active symbols resolved from database fallback ({Count}): {Symbols}",
+                fallbackSymbols.Count,
+                string.Join(", ", fallbackSymbols));
+            return fallbackSymbols;
+        }
+
+        private async Task<List<string>> GetDatabaseActiveSymbolsAsync(CancellationToken ct)
         {
             await using var db = await _root._dbFactory.CreateDbContextAsync(ct);
 

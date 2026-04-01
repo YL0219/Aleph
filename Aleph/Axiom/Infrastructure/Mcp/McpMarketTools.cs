@@ -37,12 +37,12 @@ namespace Aleph
 
         [McpServerTool(Name = "query_local_market_data", ReadOnly = true)]
         [Description(
-            "Query locally-stored OHLCV market data for a stock symbol. " +
+            "Query locally-stored OHLCV market data for a market symbol. " +
             "Returns daily candles (open, high, low, close, volume) from the Parquet data lake. " +
             "Data is sourced from prior ingestion cycles — not a live API call. " +
             "Use this for historical analysis, trend review, and portfolio monitoring.")]
         public async Task<string> QueryLocalMarketData(
-            [Description("Stock ticker symbol (e.g. AAPL, MSFT, BRK.B). 1-15 uppercase alphanumeric characters.")]
+            [Description("Market symbol (e.g. SI=F, GC=F, AAPL, BRK.B). 1-15 uppercase characters using A-Z, 0-9, dot, hyphen, equals.")]
             string symbol,
             [Description("Number of days of historical data to retrieve. MINIMUM IS 5 (to account for weekends). Defaults to 7.")]
             int days = 7)
@@ -103,12 +103,12 @@ namespace Aleph
 
         [McpServerTool(Name = "perceive_market_data", ReadOnly = true)]
         [Description(
-            "Perceive market data for ANY stock symbol — even if it's not on the background watchlist. " +
+            "Perceive market data for ANY market symbol — even if it's not on the background watchlist. " +
             "Uses a hybrid local-first + live-fetch model: returns cached Parquet history if available, " +
             "otherwise fetches live data and persists it. Also provides a live quote overlay when possible. " +
             "Use this when you need data for a symbol the system hasn't tracked before.")]
         public async Task<string> PerceiveMarketData(
-            [Description("Stock ticker symbol (e.g. GLD, AAPL, TSLA). 1-15 uppercase alphanumeric characters.")]
+            [Description("Market symbol (e.g. SI=F, CL=F, GLD, AAPL). 1-15 uppercase characters using A-Z, 0-9, dot, hyphen, equals.")]
             string symbol,
             [Description("Number of days of historical data. MINIMUM IS 5. Defaults to 90.")]
             int days = 90,
