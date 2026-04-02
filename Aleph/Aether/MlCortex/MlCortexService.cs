@@ -29,6 +29,7 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
     private readonly IAlephBus _bus;
     private readonly IAether _aether;
     private readonly IHomeostasis _homeostasis;
+    private readonly Quarantine _quarantine;
     private readonly IConfiguration _configuration;
     private readonly ILogger<MlCortexService> _logger;
 
@@ -57,12 +58,14 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
         IAlephBus bus,
         IAether aether,
         IHomeostasis homeostasis,
+        Quarantine quarantine,
         IConfiguration configuration,
         ILogger<MlCortexService> logger)
     {
         _bus = bus;
         _aether = aether;
         _homeostasis = homeostasis;
+        _quarantine = quarantine;
         _configuration = configuration;
         _logger = logger;
 
@@ -116,10 +119,18 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
     }
 
     /// <summary>
-    /// Process a single MetabolicEvent: build payload → call Python brain → publish PredictionEvent.
+    /// Process a single MetabolicEvent: screen → build payload → call Python brain → publish PredictionEvent.
     /// </summary>
     private async Task ProcessMetabolicEventAsync(MetabolicEvent me, CancellationToken ct)
     {
+        // ── Step 0: BloodFilter immune screening ──
+        var screening = BloodFilter.Screen(me);
+        if (!screening.IsHealthy)
+        {
+            _quarantine.Isolate(OrganName, me, screening);
+            return;
+        }
+
         _logger.LogDebug(
             "[MlCortex] Processing {Symbol}/{Interval} (metabolic event {EventId}).",
             me.Symbol, me.Interval, me.EventId);
@@ -176,6 +187,8 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
 
         if (!result.Success || string.IsNullOrWhiteSpace(result.PayloadJson))
         {
+            _quarantine.IsolatePythonOutput(OrganName, "cortex_predict",
+                result.Error ?? "empty payload", me.Symbol);
             _logger.LogWarning(
                 "[MlCortex] Python brain failed for {Symbol}/{Interval}: {Error}",
                 me.Symbol, me.Interval, result.Error ?? "empty payload");
@@ -190,6 +203,8 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
         }
         catch (Exception ex)
         {
+            _quarantine.IsolatePythonOutput(OrganName, "cortex_predict_parse",
+                ex.Message, me.Symbol);
             _logger.LogWarning(ex,
                 "[MlCortex] Failed to parse prediction JSON for {Symbol}/{Interval}.",
                 me.Symbol, me.Interval);
@@ -198,6 +213,17 @@ public sealed class MlCortexService : BackgroundService, IAlephOrgan
 
         if (predictionEvent is null)
             return;
+
+        // ── Step 4b: Screen the parsed PredictionEvent before publishing ──
+        var predScreening = BloodFilter.Screen(predictionEvent);
+        if (!predScreening.IsHealthy)
+        {
+            _quarantine.Isolate(OrganName, predictionEvent, predScreening);
+            _logger.LogWarning(
+                "[MlCortex] PredictionEvent failed screening for {Symbol}/{Interval}: {Anomaly}",
+                me.Symbol, me.Interval, predScreening.Anomaly);
+            return;
+        }
 
         // ── Step 5: Publish PredictionEvent into the bloodstream ──
         await _bus.PublishAsync(predictionEvent, ct);

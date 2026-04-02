@@ -60,6 +60,9 @@ builder.Services.AddHostedService<AutonomicPersistenceService>();
 // Perception — cached accessor for macro context (proxies, calendar, headlines).
 builder.Services.AddSingleton<PerceptionSnapshotCache>();
 
+// Quarantine — isolation ward for corrupted blood cells rejected by the immune system.
+builder.Services.AddSingleton<Quarantine>();
+
 // Liver — metabolic processing organ. Digests MarketDataEvent → MetabolicEvent.
 builder.Services.AddSingleton<MetabolicArtifactWriter>();
 builder.Services.AddHostedService<LiverService>();

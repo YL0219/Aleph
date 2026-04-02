@@ -16,17 +16,20 @@ public sealed class DiagnosticsController : ControllerBase
 {
     private readonly IHomeostasis _homeostasis;
     private readonly IAether _aether;
+    private readonly Quarantine _quarantine;
     private readonly ILogger<DiagnosticsController> _logger;
     private readonly string _defaultCortexSymbol;
 
     public DiagnosticsController(
         IHomeostasis homeostasis,
         IAether aether,
+        Quarantine quarantine,
         IConfiguration configuration,
         ILogger<DiagnosticsController> logger)
     {
         _homeostasis = homeostasis;
         _aether = aether;
+        _quarantine = quarantine;
         _logger = logger;
         _defaultCortexSymbol = ResolveDefaultCortexSymbol(configuration);
     }
@@ -56,6 +59,45 @@ public sealed class DiagnosticsController : ControllerBase
             activeFlags = snapshot.ActiveFlags,
             recentStressSources = snapshot.RecentStressSources,
             timestampUtc = DateTimeOffset.UtcNow,
+        });
+    }
+
+    /// <summary>
+    /// Quarantine ward — returns recent quarantined blood cells rejected by the immune system.
+    /// No Python calls. Sub-millisecond response. Read-only.
+    ///
+    /// Key fields to monitor:
+    ///   - totalQuarantined: lifetime count of rejected events.
+    ///   - totalEvicted: records lost due to ring buffer overflow. If > 0, evidence is being destroyed.
+    ///   - evidenceLoss: true if any records have been evicted.
+    ///   - recentRecords: newest-first list of quarantine records.
+    /// </summary>
+    [HttpGet("quarantine")]
+    public IActionResult GetQuarantine([FromQuery] int limit = 100)
+    {
+        // Clamp to prevent abuse
+        limit = Math.Clamp(limit, 1, 500);
+
+        var snapshot = _quarantine.GetDiagnosticSnapshot(limit);
+
+        return Ok(new
+        {
+            totalQuarantined = snapshot.TotalQuarantined,
+            totalEvicted = snapshot.TotalEvicted,
+            evidenceLoss = snapshot.EvidenceLoss,
+            bufferCapacity = snapshot.BufferCapacity,
+            currentBufferSize = snapshot.CurrentBufferSize,
+            recordCount = snapshot.RecentRecords.Count,
+            records = snapshot.RecentRecords.Select(r => new
+            {
+                quarantinedAtUtc = r.QuarantinedAtUtc,
+                organ = r.OrganName,
+                eventKind = r.EventKind,
+                anomaly = r.Anomaly,
+                eventId = r.EventId,
+                symbol = r.Symbol,
+            }),
+            snapshotAtUtc = snapshot.SnapshotAtUtc,
         });
     }
 

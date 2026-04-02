@@ -178,7 +178,8 @@ public sealed class Axiom : IAxiom
                 result.Stdout,
                 result.Stderr,
                 result.ExitCode,
-                result.TimedOut);
+                result.TimedOut,
+                result.StdoutTruncated);
         }
     }
 

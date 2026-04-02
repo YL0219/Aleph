@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace Aleph;
@@ -5,6 +6,9 @@ namespace Aleph;
 public sealed class Aether : IAether
 {
     private const int DefaultTimeoutMs = 30_000;
+
+    /// <summary>Max payload JSON size passed as a CLI argument to Python (10 MB).</summary>
+    private const int MaxPayloadJsonBytes = 10 * 1024 * 1024;
 
     private static readonly Regex SymbolPattern =
         new("^[A-Z0-9][A-Z0-9.=\\-]{0,14}$", RegexOptions.Compiled);
@@ -43,6 +47,25 @@ public sealed class Aether : IAether
         routeArgs.AddRange(arguments);
 
         var routeResult = await _axiom.Python.RunJsonAsync("aether", domain, routeArgs, timeoutMs, ct);
+
+        // ── Gate: Truncated stdout is unparseable — reject immediately ──
+        // A truncated stdout contains a half-cut JSON blob. Attempting to
+        // parse it will throw a random JsonException. Instead we surface
+        // the truncation as a structured failure that callers can quarantine.
+        if (routeResult.StdoutTruncated)
+        {
+            _logger.LogWarning(
+                "[Aether] Stdout TRUNCATED for {Domain}/{Action}. " +
+                "Payload is malformed — routing to quarantine.", domain, action);
+            return new AetherJsonResult(
+                false,
+                string.Empty,
+                $"Payload_Truncated: stdout exceeded size cap for {domain}/{action}. " +
+                "Output is malformed and will not be parsed.",
+                routeResult.ExitCode,
+                routeResult.TimedOut,
+                StdoutTruncated: true);
+        }
 
         if (!routeResult.Success)
         {
@@ -92,6 +115,22 @@ public sealed class Aether : IAether
     {
         var normalized = (region ?? string.Empty).Trim().ToLowerInvariant();
         return string.IsNullOrWhiteSpace(normalized) ? "global" : normalized;
+    }
+
+    /// <summary>
+    /// Validates that a JSON payload intended for Python IPC does not exceed the size cap.
+    /// Returns an error string if rejected, null if acceptable.
+    /// </summary>
+    private static string? ValidatePayloadSize(string? payloadJson, string label)
+    {
+        if (string.IsNullOrEmpty(payloadJson))
+            return null;
+
+        int byteCount = Encoding.UTF8.GetByteCount(payloadJson);
+        if (byteCount > MaxPayloadJsonBytes)
+            return $"{label} payload exceeds size limit ({byteCount:N0} > {MaxPayloadJsonBytes:N0} bytes).";
+
+        return null;
     }
 
     private sealed class MathGateway : IAether.IMathGateway
@@ -192,6 +231,11 @@ public sealed class Aether : IAether
             if (string.IsNullOrWhiteSpace(symbol))
                 return Task.FromResult(new AetherJsonResult(false, string.Empty, "Invalid symbol format.", -1, false));
 
+            // ── Payload size gate — reject before it reaches Python IPC ──
+            var sizeError = ValidatePayloadSize(request.MetabolicPayloadJson, "CortexPredict");
+            if (sizeError is not null)
+                return Task.FromResult(new AetherJsonResult(false, string.Empty, sizeError, -1, false));
+
             var args = new List<string>
             {
                 "--symbol", symbol,
@@ -278,6 +322,11 @@ public sealed class Aether : IAether
 
             if (!string.IsNullOrWhiteSpace(request.ChallengersJson))
             {
+                // ── Payload size gate ──
+                var sizeError = ValidatePayloadSize(request.ChallengersJson, "CortexEvaluate.Challengers");
+                if (sizeError is not null)
+                    return Task.FromResult(new AetherJsonResult(false, string.Empty, sizeError, -1, false));
+
                 args.Add("--challengers");
                 args.Add(request.ChallengersJson);
             }
@@ -367,6 +416,11 @@ public sealed class Aether : IAether
             var args = new List<string> { "--dream-id", request.DreamId };
             if (!string.IsNullOrWhiteSpace(request.StepPayloadJson))
             {
+                // ── Payload size gate ──
+                var sizeError = ValidatePayloadSize(request.StepPayloadJson, "DreamStep");
+                if (sizeError is not null)
+                    return Task.FromResult(new AetherJsonResult(false, string.Empty, sizeError, -1, false));
+
                 args.Add("--payload");
                 args.Add(request.StepPayloadJson);
             }

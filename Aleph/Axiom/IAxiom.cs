@@ -158,7 +158,8 @@ public sealed record PythonRouteResult(
     string StdoutJson,
     string Stderr,
     int ExitCode,
-    bool TimedOut);
+    bool TimedOut,
+    bool StdoutTruncated = false);
 
 public sealed record McpInvokeResult(
     string ToolContent,

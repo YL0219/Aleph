@@ -72,11 +72,24 @@ def _handle_cortex(action, argv):
         return {"ok": False, "domain": "ml", "action": action, "error": "--symbol is required."}
 
     if action == "cortex_predict":
-        # Parse the metabolic payload JSON
+        # Parse and validate the metabolic payload JSON via Pydantic contract
         try:
             payload = json.loads(args.payload)
         except json.JSONDecodeError as ex:
-            return {"ok": False, "domain": "ml", "action": action, "error": f"Invalid payload JSON: {ex}"}
+            return {"ok": False, "domain": "ml", "action": action,
+                    "error": f"Invalid payload JSON: {str(ex)[:200]}",
+                    "error_type": "json_parse", "quarantine": True}
+
+        try:
+            from contracts.aether_contracts import CortexPredictInput
+            validated_input = CortexPredictInput(**payload)
+            payload = validated_input.model_dump()
+        except ImportError:
+            pass  # Contracts not available — pass through raw dict
+        except Exception as ex:
+            return {"ok": False, "domain": "ml", "action": action,
+                    "error": f"Input contract violation: {str(ex)[:200]}",
+                    "error_type": "contract_violation", "quarantine": True}
 
         return cortex_predict(
             symbol=symbol,

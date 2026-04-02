@@ -91,7 +91,8 @@ public sealed record AetherJsonResult(
     string PayloadJson,
     string? Error,
     int ExitCode,
-    bool TimedOut);
+    bool TimedOut,
+    bool StdoutTruncated = false);
 
 public sealed record MathIndicatorsRequest(
     string Symbol,

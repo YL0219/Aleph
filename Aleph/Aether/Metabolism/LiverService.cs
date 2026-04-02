@@ -26,6 +26,7 @@ public sealed class LiverService : BackgroundService, IAlephOrgan
     private readonly IAether _aether;
     private readonly PerceptionSnapshotCache _perceptionCache;
     private readonly MetabolicArtifactWriter _artifactWriter;
+    private readonly Quarantine _quarantine;
     private readonly ILogger<LiverService> _logger;
 
     private volatile bool _isActive;
@@ -42,12 +43,14 @@ public sealed class LiverService : BackgroundService, IAlephOrgan
         IAether aether,
         PerceptionSnapshotCache perceptionCache,
         MetabolicArtifactWriter artifactWriter,
+        Quarantine quarantine,
         ILogger<LiverService> logger)
     {
         _bus = bus;
         _aether = aether;
         _perceptionCache = perceptionCache;
         _artifactWriter = artifactWriter;
+        _quarantine = quarantine;
         _logger = logger;
     }
 
@@ -105,22 +108,15 @@ public sealed class LiverService : BackgroundService, IAlephOrgan
     }
 
     /// <summary>
-    /// Digest a single MarketDataEvent: validate → run canonical math → build MetabolicEvent → publish + persist.
+    /// Digest a single MarketDataEvent: screen → run canonical math → build MetabolicEvent → publish + persist.
     /// </summary>
     private async Task DigestMarketDataAsync(MarketDataEvent mde, CancellationToken ct)
     {
-        // ── Step 1: Validate the incoming blood cell ──
-        if (!mde.Success)
+        // ── Step 1: BloodFilter immune screening ──
+        var screening = BloodFilter.Screen(mde);
+        if (!screening.IsHealthy)
         {
-            _logger.LogDebug(
-                "[Liver] Skipping failed MarketDataEvent for {Symbol}/{Interval}.",
-                mde.Symbol, mde.Interval);
-            return;
-        }
-
-        if (string.IsNullOrWhiteSpace(mde.Symbol))
-        {
-            _logger.LogWarning("[Liver] MarketDataEvent has empty symbol. Skipping.");
+            _quarantine.Isolate(OrganName, mde, screening);
             return;
         }
 
